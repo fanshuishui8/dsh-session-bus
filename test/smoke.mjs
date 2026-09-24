@@ -124,7 +124,11 @@ function finishTurn(host, agentId, msgId, turn, text) {
 
 console.log('\n== 1. 导出与工具注册 ==')
 check('name 导出正确', name === 'dsh-session-bus', String(name))
-check('inject 声明 timer', Array.isArray(inject) && inject.includes('timer'), JSON.stringify(inject))
+// inject 是硬依赖声明：静态插件若不声明 tools/agents，启动竞态下 ctx.get() 会拿到 undefined，
+// 工具会静默注册失败（动态插件因沙箱强制声明 inject，看不到这个坑）
+for (const svc of ['timer', 'tools', 'agents']) {
+  check('inject 声明 ' + svc, Array.isArray(inject) && inject.includes(svc), JSON.stringify(inject))
+}
 
 const EXPECTED = ['peer_self', 'peer_list', 'peer_send', 'peer_ask', 'peer_reply', 'peer_cancel', 'peer_inbox']
 {

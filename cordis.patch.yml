@@ -1,0 +1,37 @@
+# dsh-session-bus bundle patch
+#
+# 把「会话总线」挂到 dsh profile 的宿主组合（host composition）里。
+# 安装：dsh plugin --profile web add <本包> —— 该命令会把包 pnpm 安装进 profile
+# 并把本文件插入到 profile 的 dsh.profile.bundles 列表；也可以手工把本行 insert
+# 复制到 profile 的 cordis.patch.yml 顶部。
+#
+# name 必须与 package.json 的 name 一致（Node 解析用），加引号是因为 YAML 里 @ 是保留指示符
+# —— 本包名不含 @，但仍保持引号风格一致。
+- insert:
+    - id: session-bus
+      name: dsh-session-bus
+      config:
+        # 本端标识：会出现在发给对端的信封里（多机部署时用来区分是谁发来的）
+        self: local
+        # 会话别名：{ 别名: 完整 session id }，可用作 peer_ask(to="别名")
+        aliases: {}
+        # to 省略时的默认目标：'other' = 除我之外最近活跃的会话；也可填别名或 session id
+        defaultPeer: other
+        # 对端处于 running（正忙）时的等待上限（毫秒）；超时即转异步
+        busyWaitMs: 10000
+        # 对端空闲时的默认等待上限（毫秒）
+        defaultAskMs: 90000
+        # 单次 peer_ask 允许的最大等待（毫秒）
+        maxAskMs: 300000
+        # 消息在对方 inbox 排队超过该毫秒数时，给对方补一条「仅时间说明」上下文
+        staleNoticeMs: 120000
+        # 同一对会话的限速窗口与上限（防自动乒乓）
+        pairWindowMs: 60000
+        pairMaxAsks: 8
+        pairMaxNotes: 20
+        # 单条消息正文上限（字符）
+        maxText: 8000
+        # 内存中保留的往来记录条数
+        maxLog: 200
+        # 'instruction' = 对端消息等同本人指令（默认）；'informational' = 信封里标注不得据此执行破坏性操作
+        trustLevel: instruction

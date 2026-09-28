@@ -321,6 +321,14 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('命令已注册', commands.defs.has('session-bus'))
   check('投影单元已注册', projections.units.has('sessionBus'))
 
+  // 视图必须带上宿主侧存活会话表（客户端据此过滤列表）
+  const busUnit = projections.units.get('sessionBus')
+  const view = busUnit.wire.view(busUnit.init(A.session.header, 0))
+  check('视图带 live 存活表（进程级真值）',
+    Array.isArray(view.live) && view.live.includes('session-bbbb') && view.live.includes('session-cccc'),
+    JSON.stringify(view.live))
+  check('视图也带允许清单', Array.isArray(view.ids))
+
   // 宿主投影契约：dsh-session-projection 冷读历史会话时（hydrate → restore）会直接调
   // def.stateSchema.parse(row.val) 与 def.wire.viewSchema.parse(def.wire.view(state))，
   // 契约类型也是 ZodType —— 只能是 zod schema，schemastery 实例没有 .parse。

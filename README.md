@@ -18,14 +18,15 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 - 双向：B 也可以反过来问 A（同一对会话可以来回多轮）
 - 异步友好：对端正在跑长任务时自动转异步，答复回来时自带**原问题原文 + 提问/答复时间 + 端到端耗时**，时间轴不会乱
 - 零开销：没有任何后台轮询；没有人调用工具时它什么都不做
-- **图形界面选目标**：输入框左侧的「会话总线」按钮可以**多选**本会话能通信的会话，不用再在对话里打字指定名字（见下）；
+- **图形界面选目标**：侧栏里的「会话总线」标签可以**多选**本会话能通信的会话，不用再在对话里打字指定名字（见下）；
   面板可挂在 DSH 内置右侧栏，也可注册成 dsh-better-sidebar 的标签页（数据走插件自己的只读路由）
 - 依赖极简：只用 DSH 既有的 `agents` / `tools` / `commands` / `sessionProjections` / `sessionTitle` / `timer` 服务，外加一个 `zod`（投影单元的 stateSchema / wire.viewSchema —— 宿主契约要求的就是 zod schema，冷读时会直接调它的 `.parse`）
 
 ## 图形界面：多选可通信的会话
 
-- **入口**：输入框工具行左侧一个**纯图标小按钮**（🔗，24×24，不带文字）——点它**打开侧栏面板**；
-  按钮 tooltip 显示状态（`不限` / `已选/总数`），受限时按钮用品牌色边框提示
+- **入口**：侧栏自己的标签菜单 —— better-sidebar 里点它侧栏的「+」选「会话总线」；
+  DSH 内置右侧栏里点「新标签页」再选「会话总线」。（v0.3.3–v0.3.5 曾在输入框那一行插一个 🔗 图标按钮，
+  面板变成常驻标签后它只是重复入口，v0.3.6 删掉了。）
 - **面板体有两个落点，同一份渲染**：
   - 装了 [dsh-better-sidebar](https://www.npmjs.com/package/dsh-better-sidebar) 时 → 注册成它的标签页
     （`ctx.get('betterSidebar').registerTab({ id, title, description, icon, order, single, component })`，
@@ -104,9 +105,9 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 目录字段白名单、未附着标题批量读取与 TTL 缓存。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
-假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册与
-`openTab`、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab`（函数标题 /
-单例 / 图标 / 晚到补注册）与入口按钮的 `openTab({type}, {sessionId})` 种子形态、
+假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 45 项检查：模块与插件形状、内置落点的注册
+（**不再往输入框插按钮**）、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab`
+（函数标题 / 单例 / 图标 / 晚到补注册）、
 面板数据确实来自 `/session-bus/catalog` + `/session-bus/allow`（没有任何槽位 props） 、
 「应用」确实走 `remote.commands.execute(sessionId, 命令行, [], signal)`、
 `session/writer-held` 渲染成「会话正忙，稍后重试」、没有 `ctx.remote` 时如实报错。
@@ -131,7 +132,7 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 - [ ] B 侧出现一条【会话间消息】并作答（可选：B 用 `peer_reply` 显式回）
 - [ ] 让 B 跑一个长任务，再从 A `peer_ask` → A 只等 10 秒返回「已排队」，任务结束后答复自动进入 A
 - [ ] A 里 `peer_inbox(thread="B的标题")` 能看到成对往来与耗时
-- [ ] 输入框左侧 🔗 按钮（或 better-sidebar 的「+」菜单）→ 面板列出会话并分组；勾选 + 应用后 `peer_list` 显示 `✅允许`
+- [ ] 侧栏「+」菜单（better-sidebar）或「新标签页」（内置侧栏）→ 面板列出会话并分组；勾选 + 应用后 `peer_list` 显示 `✅允许`
 - [ ] `curl -s 'http://127.0.0.1:3080/session-bus/allow?session=<会话id>'` 能看到刚应用的 ids
 
 ## 已知限制
@@ -176,7 +177,12 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
     客户端测试 18 → 46 项；随后按真包源码修正契约（`openTab` 收标签实例种子、函数标题/图标、单例）→ 49 项。
   - 真机验收：profile 装入 dsh-better-sidebar 0.21.1（0.22.1 被 pnpm 的 release-age 策略挡下，两版相关 API 一致），
     两条只读路由与标签页渲染均在真进程 / 真浏览器里确认（详见「验证」一节）。
-- **v0.3.0 – v0.3.4** — 面板迭代：搬进右侧栏标签页（v0.3.2）、入口缩成纯图标按钮（v0.3.3）、
+- **v0.3.6** — 清掉迭代过程中留下的死代码：删掉输入框那一行的 🔗 入口按钮（面板已是常驻标签，
+  那个按钮只是重复入口；连带删掉只服务它的 `OpenButton`/`openPanel`/CSS/`all` 文案，改动覆盖 4 项断言 →
+  新增「不再往输入框插东西」的反向断言），并删掉投影 `wire.view` 里早已没人读的 `live` 存活表字段
+  （v0.3.4 起面板就不显示存活标记，而视图每次 `turn/start` 都要重算 —— 等于每轮白走一遍 agents 注册表；
+  需要「谁现在开着」仍可用只读诊断路由 `GET /session-bus/live`）。客户端测试 49 → 45 项。
+- **v0.3.0 – v0.3.4** — 面板迭代：搬进右侧栏标签页（v0.3.2）、入口缩成纯图标按钮（v0.3.3，v0.3.6 已删）、
   修「标签不注册 —— 改用 `ctx.inject` 等服务出现」（v0.3.4）、会话按工作区分组可折叠、去掉存活标记与轮询；
   投递侧新增**按需唤醒**（`allowResume`，默认开）。
 - **v0.2.1** — 修「投影 schema 用错库」导致的历史加载失败：`sessionBus` 投影的 `stateSchema` / `wire.viewSchema` 从 `@deepseek-ai/schemastery` 换成 `zod`（宿主契约是 `ZodType`，冷读时会调 `.parse`）。此前 web 端打开任何历史会话都会报 `failed to project session "session-…": def.wire.viewSchema.parse is not a function`。冒烟测试新增投影契约断言（防回归），运行时依赖由 schemastery 换成 zod。

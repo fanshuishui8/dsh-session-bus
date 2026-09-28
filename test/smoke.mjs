@@ -414,13 +414,15 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('命令已注册', commands.defs.has('session-bus'))
   check('投影单元已注册', projections.units.has('sessionBus'))
 
-  // 视图必须带上宿主侧存活会话表（客户端据此过滤列表）
+  // 视图只带允许清单：v0.3.6 起不再带 `live` 存活表（面板早就不显示存活标记，
+  // 而视图每次 turn/start 都要重算 —— 等于每轮白走一遍 agents 注册表）
   const busUnit = projections.units.get('sessionBus')
   const view = busUnit.wire.view(busUnit.init(A.session.header, 0))
-  check('视图带 live 存活表（进程级真值）',
-    Array.isArray(view.live) && view.live.includes('session-bbbb') && view.live.includes('session-cccc'),
-    JSON.stringify(view.live))
-  check('视图也带允许清单', Array.isArray(view.ids))
+  check('视图只带允许清单（没有 live 字段）',
+    Array.isArray(view.ids) && Object.prototype.hasOwnProperty.call(view, 'live') === false,
+    JSON.stringify(view))
+  check('视图字段就两个：ids / updatedAt',
+    Object.keys(view).sort().join(',') === 'ids,updatedAt', Object.keys(view).join(','))
 
   // 刷新语义：list / 空参数 → 清单不动但状态引用变化（视图重算）；turn/start 也让视图保鲜
   const st0 = projections.stateOf(A.session, 'sessionBus')

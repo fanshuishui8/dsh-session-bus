@@ -6,8 +6,7 @@
  * 做法：在假的 `window.__ModuleLoader__` / 假 React（带 useState/useEffect 与重渲染）/
  * 假 Cordis ctx / 假 fetch 下加载 lib/client.js，然后把组件树展开到 DOM 节点，断言：
  *   1. 模块 id 与插件形状；
- *   2. 没装 dsh-better-sidebar 时：注册输入框入口、右侧栏标签类型、标签体、标签标题，
- *      点入口按钮会调用 sidebarRight.openTab(kind)；
+ *   2. 没装 dsh-better-sidebar 时：注册右侧栏标签类型、标签体、标签标题（且不再往输入框插按钮）；
  *   3. 内置版面板按工作区分组、勾选后「应用」提交的正是 /session-bus allow <id…>；
  *   4. 装了 dsh-better-sidebar 时：改为 betterSidebar.registerTab(...)，不再注册内置标签页；
  *   5. better-sidebar 版面板的数据来自两条宿主只读路由（catalog / allow），
@@ -192,35 +191,21 @@ function newHost(options = {}) {
   return host
 }
 
-// ── 2/3. 没装 better-sidebar：保持现状（内置右侧栏标签页 + inputActions 写入）──────
+// ── 2. 没装 better-sidebar：保持现状（内置右侧栏标签页 + inputActions 写入）──────
 console.log('\n== 2. 未装 better-sidebar：注册项回退到内置右侧栏 ==')
 const plain = newHost()
 plugin.apply(plain.ctx)
 
-const buttonReg = plain.registrations.find((r) => r.reg.name === 'conversation.input.left')
-check('注册了输入框入口', buttonReg !== undefined && buttonReg.reg.id === 'session-bus-peers')
+check('不再往输入框那一行插任何东西（v0.3.6 删掉重复入口）',
+  plain.registrations.some((r) => r.reg.name.indexOf('conversation.input') === 0) === false,
+  JSON.stringify(plain.registrations.map((r) => r.reg.name)))
 check('注册了右侧栏标签类型', plain.tabTypes.length === 1 && plain.tabTypes[0].id === 'dsh-session-bus' && plain.tabTypes[0].kind === 'dsh-session-bus', JSON.stringify(plain.tabTypes))
 check('注册了标签体（key = 类型 id）', plain.registrations.some((r) => r.reg.name === 'sidebar.right.pane.tab' && r.reg.key === 'dsh-session-bus'))
 check('注册了标签标题（key = 类型 id）', plain.registrations.some((r) => r.reg.name === 'sidebar.right.pane.tab.title' && r.reg.key === 'dsh-session-bus'))
 check('没有 better-sidebar 时不调 registerTab', plain.betterTabs.length === 0)
 
-console.log('\n== 3. 入口按钮 → openTab ==')
-{
-  const view = mount(buttonReg.component({
-    sessionId: 'session-me',
-    useProjection: () => undefined,
-    useSessions: () => ({ ids: [], byId: {} }),
-  }))
-  const buttons = findAll(view.tree, (n) => n.type === 'button')
-  check('按钮存在且是纯图标（无文字子节点）', buttons.length === 1 && buttons[0].children.filter((c) => c.type === 'span').length === 0, JSON.stringify(buttons[0] === undefined ? null : buttons[0].props))
-  check('图标是无障碍可读的（aria-label）', buttons[0] !== undefined && typeof buttons[0].props['aria-label'] === 'string')
-  buttons[0].props.onClick()
-  check('点击调用 openTab(dsh-session-bus)', plain.openTabCalls.length === 1 && plain.openTabCalls[0] === 'dsh-session-bus', JSON.stringify(plain.openTabCalls))
-  view.unmount()
-}
-
 // ── 内置版面板：分组 + 勾选 + 应用 ───────────────────────────────────────────────
-console.log('\n== 4. 内置版面板：分组与写入（走 inputActions） ==')
+console.log('\n== 3. 内置版面板：分组与写入（走 inputActions） ==')
 {
   const panelReg = plain.registrations.find((r) => r.reg.name === 'sidebar.right.pane.tab')
   const sent = []
@@ -266,7 +251,7 @@ console.log('\n== 4. 内置版面板：分组与写入（走 inputActions） =='
 }
 
 // ── 5. 装了 better-sidebar：注册成它的标签页，数据走宿主路由 ──────────────────────
-console.log('\n== 5. 装了 better-sidebar：注册 tab + 数据走宿主只读路由 ==')
+console.log('\n== 4. 装了 better-sidebar：注册 tab + 数据走宿主只读路由 ==')
 const host = newHost({ betterSidebar: true })
 plugin.apply(host.ctx)
 check('调用了 betterSidebar.registerTab', host.betterTabs.length === 1, String(host.betterTabs.length))
@@ -277,21 +262,12 @@ check('tab id / title 正确（title 允许函数，语言可跟随）',
 check('tab 声明单例 + 排序 + 图标', tab !== undefined && tab.single === true && tab.order === 30 && typeof tab.icon === 'function', JSON.stringify(tab === undefined ? null : { single: tab.single, order: tab.order, icon: typeof tab.icon }))
 check('tab 带 component 渲染函数', tab !== undefined && typeof tab.component === 'function')
 check('装了 better-sidebar 就不再注册内置标签页', host.tabTypes.length === 0, JSON.stringify(host.tabTypes))
-check('输入框入口仍然注册', host.registrations.some((r) => r.reg.name === 'conversation.input.left'))
-{
-  // 入口按钮：装了 better-sidebar 时用它的 openTab(seed, scope)（0.22.1 的种子形态，不是 id 字符串）
-  const buttonReg2 = host.registrations.find((r) => r.reg.name === 'conversation.input.left')
-  const buttonView = mount(buttonReg2.component({ sessionId: 'session-me', useProjection: () => undefined, useSessions: () => ({ ids: [], byId: {} }) }))
-  findAll(buttonView.tree, (n) => n.type === 'button')[0].props.onClick()
-  check('点入口按钮 → betterSidebar.openTab({type}, {sessionId})',
-    host.betterOpenCalls.length === 1
-    && host.betterOpenCalls[0][0] !== null && typeof host.betterOpenCalls[0][0] === 'object'
-    && host.betterOpenCalls[0][0].type === 'dsh-session-bus'
-    && host.betterOpenCalls[0][1] !== undefined && host.betterOpenCalls[0][1].sessionId === 'session-me',
-    JSON.stringify(host.betterOpenCalls))
-  check('装了 better-sidebar 时不再调内置 sidebarRight.openTab', host.openTabCalls.length === 0, JSON.stringify(host.openTabCalls))
-  buttonView.unmount()
-}
+check('装了 better-sidebar 时也不往输入框那一行插东西',
+  host.registrations.some((r) => r.reg.name.indexOf('conversation.input') === 0) === false,
+  JSON.stringify(host.registrations.map((r) => r.reg.name)))
+check('两个落点都不再调用侧栏的 openTab（入口交给侧栏自己的标签菜单）',
+  host.openTabCalls.length === 0 && host.betterOpenCalls.length === 0,
+  JSON.stringify({ sidebarRight: host.openTabCalls, betterSidebar: host.betterOpenCalls }))
 
 // 宿主两条只读路由的假响应
 const catalogBody = {
@@ -344,7 +320,7 @@ check('允许清单真值决定勾选（allow 路由的 session-a1）', findAll(
     String(findAll(view.tree, (n) => n.type === 'input' && n.props.type === 'checkbox').length))
 }
 
-console.log('\n== 5b. better-sidebar 晚到（激活顺序不保证）：服务出现后补注册 ==')
+console.log('\n== 4b. better-sidebar 晚到（激活顺序不保证）：服务出现后补注册 ==')
 {
   const late = newHost({ betterSidebar: false })
   plugin.apply(late.ctx)
@@ -354,7 +330,7 @@ console.log('\n== 5b. better-sidebar 晚到（激活顺序不保证）：服务�
   check('补注册的 tab 与一次性注册的 id 相同', late.betterTabs[0].id === 'dsh-session-bus', JSON.stringify(late.betterTabs[0] === undefined ? null : late.betterTabs[0].id))
 }
 
-console.log('\n== 6. better-sidebar 版写入：走 remote.commands.execute ==')
+console.log('\n== 5. better-sidebar 版写入：走 remote.commands.execute ==')
 {
   const applyButton = findAll(view.tree, (n) => n.type === 'button' && n.props['data-primary'] === 'true')[0]
   const before = fetchUrls.length
@@ -372,7 +348,7 @@ console.log('\n== 6. better-sidebar 版写入：走 remote.commands.execute ==')
   check('写入过程中按钮禁用（避免重复提交）', findAll(view.tree, (n) => n.type === 'button' && n.props['data-primary'] === 'true')[0].props.disabled === false)
 }
 
-console.log('\n== 7. 写入失败如实渲染（session/writer-held → 会话正忙） ==')
+console.log('\n== 6. 写入失败如实渲染（session/writer-held → 会话正忙） ==')
 {
   host.remoteResult = { ok: false, error: { code: 'session/writer-held', message: 'writer is held by another tab' } }
   const applyButton = findAll(view.rerender(), (n) => n.type === 'button' && n.props['data-primary'] === 'true')[0]
@@ -398,7 +374,7 @@ console.log('\n== 7. 写入失败如实渲染（session/writer-held → 会话�
   view.unmount()
 }
 
-console.log('\n== 8. remote 服务缺失时如实报错（不静默） ==')
+console.log('\n== 7. remote 服务缺失时如实报错（不静默） ==')
 {
   // 一个「只有 slots/locale/betterSidebar，没有 remote」的宿主
   const host2 = newHost({ betterSidebar: true })

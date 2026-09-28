@@ -104,18 +104,24 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 目录字段白名单、未附着标题批量读取与 TTL 缓存。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
-假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 46 项检查：模块与插件形状、内置落点的注册与
-`openTab`、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab` 与晚到补注册、
+假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册与
+`openTab`、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab`（函数标题 /
+单例 / 图标 / 晚到补注册）与入口按钮的 `openTab({type}, {sessionId})` 种子形态、
 面板数据确实来自 `/session-bus/catalog` + `/session-bus/allow`（没有任何槽位 props） 、
 「应用」确实走 `remote.commands.execute(sessionId, 命令行, [], signal)`、
 `session/writer-held` 渲染成「会话正忙，稍后重试」、没有 `ctx.remote` 时如实报错。
 
-> ⚠ **尚未验证的部分**：`dsh-better-sidebar` 目前**没有**装进本机 profile（装了要重启宿主），
-> 所以 better-sidebar 落点的**真实渲染**只在假宿主里验证过 —— 注册调用、组件渲染、
-> 取数与写入路径都是真的（走的是同一份 `lib/client.js`），但「它自己的标签栏里长什么样」没人看过。
+真机验证（2026-09-28，DSH 0.1.7-rc.2 + dsh-better-sidebar 0.21.1）：
+
+- 宿主两路由在真进程上 200：`catalog` 返回 2 个工作区 / 66 行会话 / 12.5KB（冷读 18ms、TTL 内 8ms），
+  `allow` 返回 `{ids, unrestricted}`；围栏实测 非 loopback Host → 403、POST → 405、缺参 → 400。
+- better-sidebar 落点的**真实渲染已在浏览器里确认**：侧栏标签栏出现「会话总线」标签，
+  面板按工作区分组（`dsh 12 / Python 31 / 未分组 1`，= 目录 66 行 − 归档 22），
+  底部有「刷新」键（只有宿主路由版才有）→ 走的是 `/session-bus/catalog` + `/session-bus/allow`。
 
 改完**浏览器半**不需要重启 `dsh web`：用 plugin_manager 对 `include:session-bus` 做一次
-「禁用 → 启用」重算组合，然后刷新页面即可；改**宿主半**才需要重启 `dsh web`。
+「禁用 → 启用」重算组合，然后刷新页面即可。改**宿主半**通常要重启；但实测**安装/升级任何 bundle**
+触发的整轮重算会连宿主模块一起重新 import —— 那次装 better-sidebar 之后，新的只读路由当场就 200 了。
 
 真机验收清单：
 
@@ -125,15 +131,14 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 - [ ] B 侧出现一条【会话间消息】并作答（可选：B 用 `peer_reply` 显式回）
 - [ ] 让 B 跑一个长任务，再从 A `peer_ask` → A 只等 10 秒返回「已排队」，任务结束后答复自动进入 A
 - [ ] A 里 `peer_inbox(thread="B的标题")` 能看到成对往来与耗时
-- [ ] 输入框左侧 🔗 按钮 → 面板列出会话并分组；勾选 + 应用后 `peer_list` 显示 `✅允许`
-- [ ] `curl -s 'http://127.0.0.1:3080/session-bus/catalog?session=<会话id>' | head -c 400` 能看到工作区与会话
+- [ ] 输入框左侧 🔗 按钮（或 better-sidebar 的「+」菜单）→ 面板列出会话并分组；勾选 + 应用后 `peer_list` 显示 `✅允许`
+- [ ] `curl -s 'http://127.0.0.1:3080/session-bus/allow?session=<会话id>'` 能看到刚应用的 ids
 
 ## 已知限制
 
 - **单进程**：两个会话必须在同一个 `dsh` 进程里（同一台 `dsh web`）。
-- **better-sidebar 落点未经真机验证**：`dsh-better-sidebar` 没装进本机 profile（装了要重启宿主），
-  该落点只在假宿主里验证过注册、渲染、取数与写入；另外这条落点的面板不显示「相对时间」——
-  宿主目录路由只给 id/标题/running/归档，宁可不显示也不显示错的。
+- **better-sidebar 落点不显示「相对时间」**：宿主目录路由只给 id/标题/running/归档，
+  宁可不显示也不显示错的。
 - **内存态**：往来记录、待答复关联只在内存里；进程重启后旧的 `corr` 不再可答复（会明确报「找不到 corr」）。
 - **不唤醒冷会话**：目标必须存活；不会自动 resume（避免抢占用户会话/挂错 preset）。
 - **会消耗 token**：被唤醒的对端会真实跑一轮模型。
@@ -168,8 +173,9 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
   - 浏览器半新增 **dsh-better-sidebar 适配**：装了就把面板注册成它的标签页，
     数据走上面两条路由、写入走 `remote.commands.execute`，**不再依赖 DSH 槽位 props**；
     没装则保持内置右侧栏实现。写入失败如实渲染（`session/writer-held` → 「会话正忙，稍后重试」）。
-    客户端测试 18 → 46 项。
-  - 注意：better-sidebar 未装进 profile，其真实渲染尚未在浏览器里验证。
+    客户端测试 18 → 46 项；随后按真包源码修正契约（`openTab` 收标签实例种子、函数标题/图标、单例）→ 49 项。
+  - 真机验收：profile 装入 dsh-better-sidebar 0.21.1（0.22.1 被 pnpm 的 release-age 策略挡下，两版相关 API 一致），
+    两条只读路由与标签页渲染均在真进程 / 真浏览器里确认（详见「验证」一节）。
 - **v0.3.0 – v0.3.4** — 面板迭代：搬进右侧栏标签页（v0.3.2）、入口缩成纯图标按钮（v0.3.3）、
   修「标签不注册 —— 改用 `ctx.inject` 等服务出现」（v0.3.4）、会话按工作区分组可折叠、去掉存活标记与轮询；
   投递侧新增**按需唤醒**（`allowResume`，默认开）。

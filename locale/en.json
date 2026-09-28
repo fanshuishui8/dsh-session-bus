@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Bus",
+    "description": "Let sessions in one dsh process message each other, with a multi-select picker beside the composer."
+  }
+}

@@ -16,7 +16,7 @@
  * 每个用例用独立宿主，避免共享限速窗口互相干扰。
  */
 
-import { apply, name, inject } from '../lib/index.js'
+import { apply, name, inject, parseSelection } from '../lib/index.js'
 
 const ALLOWED_SCHEMA_KEYWORDS = new Set([
   'type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
@@ -76,11 +76,41 @@ function newFleet(config = {}) {
       if (service === 'tools') return { register: (def) => { tools.set(def.name, def); return () => tools.delete(def.name) } }
       if (service === 'agents') return registry
       if (service === 'sessionTitle') return { get: (session) => ({ title: session.__title }) }
+      if (service === 'commands') return commands
+      if (service === 'sessionProjections') return projections
       return undefined
     },
     on(event, fn) { listeners.set(event, fn); return () => listeners.delete(event) },
     effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
     timeout(fn, ms) { const h = setTimeout(fn, ms); return () => clearTimeout(h) },
+  }
+
+  // 假投影注册表：够用来验证「命令事件 → 允许清单」的折叠与读取
+  const projections = {
+    units: new Map(),
+    states: new Map(),
+    register(definition) { projections.units.set(definition.key, definition); return () => projections.units.delete(definition.key) },
+    /** 测试辅助：把一个会话事件喂给所有单元（引用不变则视为未改动）。 */
+    drive(session, event) {
+      for (const [key, unit] of projections.units) {
+        const k = String(session.id) + '::' + key
+        const prev = projections.states.has(k) ? projections.states.get(k) : unit.init(session.header, 0)
+        const next = unit.apply(prev, event)
+        if (next !== prev) projections.states.set(k, next)
+      }
+    },
+    stateOf(session, key) {
+      const unit = projections.units.get(key)
+      if (unit === undefined) return undefined
+      const k = String(session.id) + '::' + key
+      return projections.states.has(k) ? projections.states.get(k) : unit.init(session.header, 0)
+    },
+  }
+
+  // 假命令注册表：暴露 handler 供测试直接驱动
+  const commands = {
+    defs: new Map(),
+    register(definition) { commands.defs.set(definition.name, definition); return () => commands.defs.delete(definition.name) },
   }
 
   function addAgent(id, title, status = 'idle') {
@@ -106,7 +136,17 @@ function newFleet(config = {}) {
   apply(ctx, Object.assign({ self: 'test', defaultAskMs: 60000, busyWaitMs: 5000 }, config))
   const A = addAgent('session-aaaa', '会话A')
   const B = addAgent('session-bbbb', '会话B')
-  return { ctx, tools, emit, A, B, agents }
+  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent }
+}
+
+/** 模拟一条 `/session-bus …` 命令落地：先写 command/run 事件，再调用处理器。 */
+function runCommand(fleet, agent, args) {
+  const session = agent.session
+  fleet.emitRaw = fleet.emitRaw || null
+  const unitEvent = { type: 'command/run', seq: 10000 + (runCommand.seq = (runCommand.seq || 0) + 1), time: Date.now(), data: { commandId: 'c' + runCommand.seq, name: 'session-bus', args, source: 'ui' } }
+  fleet.projections.drive(session, unitEvent)
+  const def = fleet.commands.defs.get('session-bus')
+  return def === undefined ? { kind: 'error', text: '命令未注册' } : def.handler({ commandId: 'c', agent, rawInput: args, attachments: [], signal: undefined })
 }
 
 function corrOf(agent, index = -1) {
@@ -258,6 +298,65 @@ console.log('\n== 7. peer_inbox / peer_self 可读性 ==')
   check('peer_self 报告 self 标识', self.text.includes('self=test'), self.text)
   const list = await tools.get('peer_list').execute({}, { agent: A })
   check('peer_list 列出对端', list.text.includes('session-bbbb'), list.text.slice(0, 160))
+}
+
+console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
+{
+  // 参数解析
+  const allow = parseSelection('allow session-bbbb 会话C')
+  check('parseSelection: allow 取 token', allow.mutates === true && allow.ids.length === 2 && allow.ids[0] === 'session-bbbb', JSON.stringify(allow))
+  check('parseSelection: clear 清空', parseSelection('clear').mutates === true && parseSelection('clear').ids.length === 0)
+  check('parseSelection: all → *', parseSelection('all').ids[0] === '*')
+  check('parseSelection: list 不改动', parseSelection('list').mutates === false)
+  check('parseSelection: 留空不改动', parseSelection('').mutates === false)
+  check('parseSelection: 未知动词不改动', parseSelection('frobnicate x').mutates === false && parseSelection('frobnicate x').verb === 'unknown')
+
+  const fleet = newFleet({ defaultAskMs: 1200 })
+  const { tools, projections, commands, A, B } = fleet
+  const C = fleet.addAgent('session-cccc', '会话C')
+  check('命令已注册', commands.defs.has('session-bus'))
+  check('投影单元已注册', projections.units.has('sessionBus'))
+
+  // 投影只在本插件命令的改动型输入上改写状态
+  projections.drive(A.session, { type: 'command/run', seq: 1, time: 1, data: { name: 'other-command', args: 'allow session-cccc' } })
+  check('忽略其它命令的事件', projections.stateOf(A.session, 'sessionBus').ids.length === 0)
+  projections.drive(A.session, { type: 'command/run', seq: 2, time: 2, data: { name: 'session-bus', args: 'list' } })
+  check('list 不改写状态', projections.stateOf(A.session, 'sessionBus').ids.length === 0)
+
+  // 允许 B
+  let out = runCommand(fleet, A, 'allow session-bbbb')
+  check('命令回执成功', out.kind === 'success' && out.text.includes('已允许 1 个会话'), JSON.stringify(out))
+  check('清单已折叠进投影', JSON.stringify(projections.stateOf(A.session, 'sessionBus').ids) === JSON.stringify(['session-bbbb']))
+
+  // 允许后：投递 B 正常，投递 C 被拦
+  let got = await tools.get('peer_ask').execute({ to: 'session-bbbb', text: '允许内' }, { agent: A })
+  check('允许清单内可投递', got.status === 'timeout' || got.status === 'answered', JSON.stringify(got).slice(0, 100))
+  const blocked = await tools.get('peer_ask').execute({ to: 'session-cccc', text: '越界' }, { agent: A })
+  check('清单外被拒绝', blocked.ok === false && blocked.text.includes('不在本会话的允许清单里'), JSON.stringify(blocked).slice(0, 160))
+  check('被拒绝时不投递', C.inbox.length === 0, 'inbox=' + C.inbox.length)
+
+  // 'other' 优先选清单内的（C 更新，若不受限会选 C）
+  const other = await tools.get('peer_send').execute({ to: 'other', text: '给允许的那个' }, { agent: A })
+  check('other 在受限时选清单内会话', other.ok === true && B.inbox.length >= 1 && C.inbox.length === 0, JSON.stringify(other).slice(0, 120))
+
+  // 列表与自述标注
+  const list = await tools.get('peer_list').execute({}, { agent: A })
+  check('peer_list 标注允许/未允许', list.text.includes('✅允许') && list.text.includes('⛔未允许'), list.text.slice(0, 200))
+  const self = await tools.get('peer_self').execute({}, { agent: A })
+  check('peer_self 显示允许清单', self.text.includes('允许清单：1 个'), self.text.slice(0, 220))
+
+  // 清空 / 不限 / 未知参数
+  out = runCommand(fleet, A, 'clear')
+  check('clear 后不再限制', out.kind === 'success' && projections.stateOf(A.session, 'sessionBus').ids.length === 0)
+  const free = await tools.get('peer_send').execute({ to: 'session-cccc', text: '解禁后可以发' }, { agent: A })
+  check('解禁后可投递', free.ok === true && C.inbox.length === 1, JSON.stringify(free).slice(0, 120))
+  out = runCommand(fleet, A, 'all')
+  check('all → 状态存 *', projections.stateOf(A.session, 'sessionBus').ids[0] === '*')
+  check('all 后 peer_self 报告未限制', (await tools.get('peer_self').execute({}, { agent: A })).text.includes('未限制'))
+  out = runCommand(fleet, A, 'frobnicate')
+  check('未知参数回执为错误', out.kind === 'error' && out.text.includes('未知参数'), JSON.stringify(out))
+  out = runCommand(fleet, A, 'allow 不存在的会话名')
+  check('无法解析的 token 会说明', out.kind === 'error' && out.text.includes('未能解析'), JSON.stringify(out))
 }
 
 console.log('\n' + (failures === 0 ? '全部通过 ✅' : failures + ' 项失败 ❌'))

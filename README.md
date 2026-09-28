@@ -105,11 +105,12 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 目录字段白名单、未附着标题批量读取与 TTL 缓存。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
-假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 45 项检查：模块与插件形状、内置落点的注册
+假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 46 项检查：模块与插件形状、内置落点的注册
 （**不再往输入框插按钮**）、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab`
 （函数标题 / 单例 / 图标 / 晚到补注册）、
 面板数据确实来自 `/session-bus/catalog` + `/session-bus/allow`（没有任何槽位 props） 、
-「应用」确实走 `remote.commands.execute(sessionId, 命令行, [], signal)`、
+「应用」确实走 `remote.commands.execute(sessionId, 命令行, [], signal)`（假宿主照抄了真 Cordis 的规则：
+`get('remote').commands` 这种属性访问会抛 `without inject`，写错就红）、
 `session/writer-held` 渲染成「会话正忙，稍后重试」、没有 `ctx.remote` 时如实报错。
 
 真机验证（2026-09-28，DSH 0.1.7-rc.2 + dsh-better-sidebar 0.21.1）：
@@ -164,8 +165,19 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 8. **面板数据别绑死在宿主槽位 props 上**：DSH 槽位给的 `useSessions` / `useWorkspaces` / `useProjection` / `inputActions` 只在内置 UI 里存在。一旦面板要搬到第三方侧栏（dsh-better-sidebar），取数就得改走**自己的只读路由**、写入改走 `ctx.remote.commands.execute` —— 否则「换个容器」会变成「重写面板」。本包的做法是：渲染只有一份（`PanelView`），取数/写入各两套，落点由 `ctx.get('betterSidebar')` 是否存在决定。
 9. **`remote.commands.execute` 的调用形态**：客户端生成的方法有两种形态 —— 调用方 ctx 本身带 agent 身份时走 **scoped**（业务参数只有 `line` + 附件），否则走 **direct**（第一个业务参数是 session id）。DSH 自己的浏览器代码（`dsh-client-ui-commands`、`dsh-api-session-controller` 的 client 半）一律用 `execute(sessionId, line, attachments)`，本包照抄这一种；传错形态不会静默出错，客户端会直接抛参数个数/类型错误。
 10. **面板块「刷新」的成本要自己管**：面板 3 秒轮询两条路由，宿主侧必须给「读历史日志」这类操作加 TTL 缓存（本包：标题 15s、持久化目录 10s），否则开着面板就等于每 3 秒把历史会话日志重读一遍。
+11. **dotted 服务名只能用反射 `get` 取，不能点属性**：Cordis 里 `remote.commands` 是注册名就叫 `remote.commands` 的服务（`super(ctx, remoteServiceKey(name))`），而 `ctx.get('remote')` 返回的是 **traceable 代理** —— 在它上面点 `.commands` 会被代理当成**属性访问**，走 `internal/get` 的纤维回溯，要求访问方 fiber 在 `inject` 里声明过该服务，否则抛 `cannot get property "remote.commands" without inject`。三种写法里只有 `ctx.get('remote.commands')`（反射 get，直接查 store）无条件可用。这个坑在假宿主里看不出来（假 ctx 往往就是普通对象），本包 v0.3.5 就是这样带着全绿测试上了真机、被用户点「应用」时炸出来的：**凡是跨服务的取用，假宿主都要照抄真规则**。
 
 ## 更新记录
+
+- **v0.3.7** — 修真机 bug：**「应用」报 `cannot get property "remote.commands" without inject`**。
+  现象：在 better-sidebar 面板里勾选会话点「应用」，面板底部如实显示这条错误，允许清单没写进去。
+  根因：取远程命令执行面写的是 `ctx.get('remote').commands` —— 真 Cordis 里 `remote.commands` 是**独立的
+  dotted 服务名**，而 `get('remote')` 返回的是 traceable 代理，再点 `.commands` 会被当成**属性访问**，
+  要求调用方 fiber 在 `inject` 里声明过它，于是被 Cordis 拦下（Node 里用真 cordis 复现：
+  `get('remote.commands')` ✅ / `get('remote').commands` ❌ / `ctx['remote.commands']` ❌）。
+  假宿主里没有这条规则，所以单元测试当时全绿 —— 是用户真机点出来的。
+  修法：改成反射 get 的 dotted 形式 `remoteCtx.get('remote.commands')`；并把这条规则**做进假宿主**
+  （属性访问直接抛同样的错），写错就红；再加一项反向断言。客户端测试 45 → 46 项。
 
 - **v0.3.5** — 面板与宿主 UI 解耦（方向 A）：
   - 宿主新增两条只读路由 `GET /session-bus/catalog`（工作区 + 会话目录，字段白名单）与

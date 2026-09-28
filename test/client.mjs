@@ -149,10 +149,15 @@ function newHost(options = {}) {
     registerTab: (descriptor) => { host.betterTabs.push(descriptor); return () => {} },
     openTab: (...args) => { host.betterOpenCalls.push(args) },
   }
+  // 远程命令执行面：真 Cordis 里它是**独立的 dotted 服务** `remote.commands`，
+  // 而 `ctx.get('remote').commands` 这种「先取 remote 再点 commands」会被 Cordis 当成属性访问拒绝
+  // （`cannot get property "remote.commands" without inject`）。假宿主照抄这条规则 ——
+  // v0.3.5 就是因为没照抄，写出了只有真机才炸的取服务代码。
+  host.remoteCommands = {
+    execute: (...args) => { host.remoteCalls.push(args); return Promise.resolve(host.remoteResult) },
+  }
   host.remote = {
-    commands: {
-      execute: (...args) => { host.remoteCalls.push(args); return Promise.resolve(host.remoteResult) },
-    },
+    get commands() { throw new Error('cannot get property "remote.commands" without inject') },
   }
   host.locale = { register: () => () => {}, getSnapshot: () => ({ active: 'zh-CN' }), subscribe: () => () => {} }
   host.hasBetter = options.betterSidebar === true
@@ -163,6 +168,7 @@ function newHost(options = {}) {
       if (name === 'sidebarRight') return host.sidebarRight
       if (name === 'locale') return host.locale
       if (name === 'betterSidebar') return host.hasBetter === true ? host.better : undefined
+      if (name === 'remote.commands') return host.remoteCommands
       if (name === 'remote') return host.remote
       return undefined
     },
@@ -331,6 +337,8 @@ console.log('\n== 4b. better-sidebar 晚到（激活顺序不保证）：服务�
 }
 
 console.log('\n== 5. better-sidebar 版写入：走 remote.commands.execute ==')
+check('假宿主照抄了 Cordis 规则：get("remote").commands 会抛 without inject',
+  (() => { try { host.ctx.get('remote').commands.execute('s', 'x', []); return false } catch (error) { return String(error.message).indexOf('without inject') >= 0 } })())
 {
   const applyButton = findAll(view.tree, (n) => n.type === 'button' && n.props['data-primary'] === 'true')[0]
   const before = fetchUrls.length
@@ -379,7 +387,7 @@ console.log('\n== 7. remote 服务缺失时如实报错（不静默） ==')
   // 一个「只有 slots/locale/betterSidebar，没有 remote」的宿主
   const host2 = newHost({ betterSidebar: true })
   const noRemote = {
-    get: (name) => (name === 'remote' ? undefined : host2.ctx.get(name)),
+    get: (name) => (name === 'remote.commands' || name === 'remote' ? undefined : host2.ctx.get(name)),
     effect: host2.ctx.effect,
     inject: host2.ctx.inject,
   }

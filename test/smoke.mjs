@@ -329,6 +329,17 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
     JSON.stringify(view.live))
   check('视图也带允许清单', Array.isArray(view.ids))
 
+  // 刷新语义：list / 空参数 → 清单不动但状态引用变化（视图重算）；turn/start 也让视图保鲜
+  const st0 = projections.stateOf(A.session, 'sessionBus')
+  projections.drive(A.session, { type: 'command/run', seq: 900, time: 9, data: { name: 'session-bus', args: 'list' } })
+  const st1 = projections.stateOf(A.session, 'sessionBus')
+  check('/session-bus list 触发重算但不改清单', st1 !== st0 && JSON.stringify(st1.ids) === JSON.stringify(st0.ids) && st1.stamp > st0.stamp, JSON.stringify(st1))
+  projections.drive(A.session, { type: 'turn/start', seq: 901, time: 10, data: { turn: 1 } })
+  const st2 = projections.stateOf(A.session, 'sessionBus')
+  check('turn/start 让视图保鲜（stamp 自增）', st2.stamp > st1.stamp && JSON.stringify(st2.ids) === JSON.stringify(st1.ids), JSON.stringify(st2))
+  projections.drive(A.session, { type: 'assistant/message', seq: 902, time: 11, data: { turn: 1, step: 1, message: { id: 'm', role: 'assistant', content: [] } } })
+  check('无关事件保持同一引用（不产生多余发布）', projections.stateOf(A.session, 'sessionBus') === st2)
+
   // 宿主投影契约：dsh-session-projection 冷读历史会话时（hydrate → restore）会直接调
   // def.stateSchema.parse(row.val) 与 def.wire.viewSchema.parse(def.wire.view(state))，
   // 契约类型也是 ZodType —— 只能是 zod schema，schemastery 实例没有 .parse。

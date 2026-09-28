@@ -16,11 +16,14 @@
  *      （dsh-session-projection 的 hydrate() → restore()）会调用的 .parse，
  *      且 wire.view 的结果能通过校验 —— 用 schemastery 顶替 zod 会在这一步炸成
  *      `def.wire.viewSchema.parse is not a function`。
+ *   9. 只读路由：/session-bus/live 的信任判定，以及面板数据路由
+ *      /session-bus/catalog（工作区 + 会话目录；字段白名单、未附着标题批量读取、TTL 缓存）
+ *      与 /session-bus/allow（允许清单真值 {ids, unrestricted}）的 200/400/403/404/405。
  *
  * 每个用例用独立宿主，避免共享限速窗口互相干扰。
  */
 
-import { apply, name, inject, parseSelection, isTrustedLiveRequest, LIVE_PATH } from '../lib/index.js'
+import { apply, name, inject, parseSelection, isTrustedLiveRequest, LIVE_PATH, CATALOG_PATH, ALLOW_PATH } from '../lib/index.js'
 
 const ALLOWED_SCHEMA_KEYWORDS = new Set([
   'type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
@@ -83,6 +86,50 @@ function newFleet(config = {}) {
     register(route) { webServer.routes.set(route.path, route); return () => webServer.routes.delete(route.path) },
   }
 
+  // 假 sessions（内存会话 store）：真实宿主里只装**进程里已加载**的会话，所以这里只从 agents 派生
+  const coldSessions = new Map()   // 冷会话（只在持久化里），由测试用 addColdSession 塞
+  const sessionsStore = {
+    get: (id) => {
+      const agent = agents.get(String(id))
+      return agent === undefined ? undefined : agent.session
+    },
+    list: () => [...agents.values()].map((a) => a.session),
+  }
+
+  // 假 workspaceRegistry：工作区列表 + 归档集合（测试用 setWorkspaces 摆数据）
+  const workspaceRegistry = {
+    workspaces: [],
+    archivedSessionIds: [],
+    list() { return workspaceRegistry.workspaces },
+  }
+
+  // 假 sessionQuery：listSessions = 持久化目录；readTitleSnapshots = 未附着会话的批量标题观测
+  const sessionQuery = {
+    reads: [],
+    lists: 0,
+    async listSessions() {
+      sessionQuery.lists += 1
+      return [...coldSessions.values()].map((s) => ({ header: s.header, live: false, persisted: true }))
+    },
+    async readTitleSnapshots(ids) {
+      sessionQuery.reads.push(ids.slice())
+      return ids.map((id) => {
+        const key = String(id)
+        if (key.indexOf('bad') >= 0) return { sessionId: key, status: 'rejected', reason: new Error('读不了这个会话') }
+        const cold = coldSessions.get(key)
+        const header = cold !== undefined ? cold.header : { id: key, createdAt: 1000, cwd: '/tmp/cold', version: 4, isSeeded: false }
+        return {
+          sessionId: key,
+          status: 'fulfilled',
+          value: Object.assign(
+            { session: header },
+            key.indexOf('notitle') >= 0 ? {} : { title: { title: '标题 ' + key, eventSeq: 1, updatedAt: 2000 } },
+          ),
+        }
+      })
+    },
+  }
+
   const ctx = {
     get(service) {
       if (service === 'tools') return { register: (def) => { tools.set(def.name, def); return () => tools.delete(def.name) } }
@@ -92,6 +139,9 @@ function newFleet(config = {}) {
       if (service === 'sessionProjections') return projections
       if (service === 'webServer') return webServer
       if (service === 'sessionController') return sessionController
+      if (service === 'sessions') return sessionsStore
+      if (service === 'workspaceRegistry') return workspaceRegistry
+      if (service === 'sessionQuery') return sessionQuery
       return undefined
     },
     webServer, // 插件通过 ctx.inject(['webServer'], (webCtx) => webCtx.webServer...) 使用
@@ -161,10 +211,25 @@ function newFleet(config = {}) {
     fn({ id: sessionId }, { type, seq, time: Date.now(), data })
   }
 
+  /** 摆工作区数据（面板目录路由的数据源）。 */
+  function setWorkspaces(items, archived = []) {
+    workspaceRegistry.workspaces = items
+    workspaceRegistry.archivedSessionIds = archived
+  }
+  /** 塞一个「未附着」的冷会话（历史会话，只在持久化里，不在 agents 里）。 */
+  function addColdSession(id, origin) {
+    const session = { id: String(id), header: { id: String(id), createdAt: 1000, cwd: '/tmp/cold', version: 4, isSeeded: false, ...(origin === undefined ? {} : { origin }) } }
+    coldSessions.set(String(id), session)
+    return session
+  }
+
   apply(ctx, Object.assign({ self: 'test', defaultAskMs: 60000, busyWaitMs: 5000 }, config))
   const A = addAgent('session-aaaa', '会话A')
   const B = addAgent('session-bbbb', '会话B')
-  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent, webServer, sessionController }
+  return {
+    ctx, tools, emit, A, B, agents, projections, commands, addAgent, webServer, sessionController,
+    setWorkspaces, addColdSession, sessionQuery, workspaceRegistry, sessionsStore,
+  }
 }
 
 /** 模拟一条 `/session-bus …` 命令落地：先写 command/run 事件，再调用处理器。 */
@@ -495,6 +560,86 @@ console.log('\n== 10. 按需唤醒（allowResume）==')
   const other = 'session-feedface-0000-0000-0000-000000000003'
   const blocked = await fleet2.tools.get('peer_send').execute({ to: other, text: '越界' }, { agent: fleet2.A })
   check('允许清单外的未附着 id 被拦', blocked.ok === false && String(blocked.text).includes('不在本会话的允许清单里'), JSON.stringify(blocked).slice(0, 160))
+}
+
+console.log('\n== 11. 面板只读路由：catalog / allow ==')
+{
+  check('路由路径固定', CATALOG_PATH === '/session-bus/catalog' && ALLOW_PATH === '/session-bus/allow')
+
+  const HOST = { host: '127.0.0.1:3080' }
+  async function call(route, req) {
+    let status = 0
+    let body = ''
+    const res = { writeHead(code) { status = code }, end(chunk) { if (typeof chunk === 'string') body = chunk } }
+    route.handler(req, res)
+    await sleep(10)   // catalog 是异步的（要读未附着会话的标题）
+    return { status, body }
+  }
+
+  const fleet = newFleet({ defaultAskMs: 50 })
+  fleet.B.status = 'running'
+  const SUB = fleet.addAgent('session-sub123', '子代理')
+  SUB.session.header.origin = 'subagent'
+  fleet.setWorkspaces([
+    { id: 'ws-1', title: '项目一', path: '/tmp/one', sessionIds: ['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1'] },
+    { id: 'ws-2', title: '项目二', path: '/tmp/two', sessionIds: ['session-cold2', 'session-sub123'] },
+  ], ['session-cold2'])
+  fleet.addColdSession('session-cold1')
+  fleet.addColdSession('session-cold2')
+  fleet.addColdSession('session-orphan1')   // 不属于任何工作区：面板会把它显示成「未分组」
+
+  const catalogRoute = fleet.webServer.routes.get(CATALOG_PATH)
+  check('目录路由已注册（exact）', catalogRoute !== undefined && catalogRoute.kind === 'exact')
+  let out = await call(catalogRoute, { method: 'GET', url: CATALOG_PATH + '?session=session-aaaa', headers: HOST })
+  check('可信 GET 返回 200', out.status === 200, String(out.status))
+  const cat = JSON.parse(out.body)
+  check('目录含工作区（workspaceId/标题/path/sessionIds）',
+    Array.isArray(cat.workspaces) && cat.workspaces.length === 2
+    && cat.workspaces[0].workspaceId === 'ws-1' && cat.workspaces[0].title === '项目一' && cat.workspaces[0].path === '/tmp/one'
+    && JSON.stringify(cat.workspaces[0].sessionIds) === JSON.stringify(['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1']),
+    JSON.stringify(cat.workspaces))
+  const rows = new Map(cat.sessions.map((r) => [r.id, r]))
+  check('自己不出现在目录里', rows.has('session-aaaa') === false, JSON.stringify([...rows.keys()]))
+  check('subagent 会话被过滤', rows.has('session-sub123') === false, JSON.stringify([...rows.keys()]))
+  check('附着会话标 attached、标题取自 sessionTitle', rows.get('session-bbbb').attached === true && rows.get('session-bbbb').title === '会话B', JSON.stringify(rows.get('session-bbbb')))
+  check('running 取自 agent 状态', rows.get('session-bbbb').running === true, JSON.stringify(rows.get('session-bbbb')))
+  check('未附着会话标题来自批量观测', rows.get('session-cold1').attached === false && rows.get('session-cold1').title === '标题 session-cold1', JSON.stringify(rows.get('session-cold1')))
+  check('归档标记如实带出', rows.get('session-cold2').archived === true && rows.get('session-cold1').archived === false, JSON.stringify([rows.get('session-cold2'), rows.get('session-cold1')]))
+  check('没有标题的会话退化为空串（客户端用 id 兜底）', rows.get('session-notitle1').title === '' && rows.get('session-bad1').title === '', JSON.stringify([rows.get('session-notitle1'), rows.get('session-bad1')]))
+  check('工作区里登记但读不到 header 的会话也会列出', rows.has('session-ghost1') === true, JSON.stringify([...rows.keys()]))
+  check('不属于任何工作区的历史会话也列出（面板显示为「未分组」）', rows.has('session-orphan1') === true, JSON.stringify([...rows.keys()]))
+  check('目录行的字段是白名单（无 cwd / 事件 / 日志）',
+    Object.keys(rows.get('session-bbbb')).sort().join(',') === 'archived,attached,id,running,title',
+    Object.keys(rows.get('session-bbbb')).join(','))
+  check('未附着标题一次批量读完', fleet.sessionQuery.reads.length === 1 && fleet.sessionQuery.reads[0].length === 6, JSON.stringify(fleet.sessionQuery.reads))
+
+  out = await call(catalogRoute, { method: 'GET', url: CATALOG_PATH + '?session=session-aaaa', headers: HOST })
+  check('TTL 内不重复读未附着会话标题', fleet.sessionQuery.reads.length === 1, String(fleet.sessionQuery.reads.length))
+  check('TTL 内不重复扫持久化目录', fleet.sessionQuery.lists === 1, String(fleet.sessionQuery.lists))
+
+  out = await call(catalogRoute, { method: 'HEAD', url: CATALOG_PATH, headers: HOST })
+  check('HEAD 返回 200 且无正文', out.status === 200 && out.body === '', JSON.stringify(out))
+  out = await call(catalogRoute, { method: 'GET', url: CATALOG_PATH, headers: { host: 'evil.example.com' } })
+  check('目录路由：不可信 Host 403', out.status === 403, String(out.status))
+  out = await call(catalogRoute, { method: 'POST', url: CATALOG_PATH, headers: HOST })
+  check('目录路由：非 GET/HEAD 405', out.status === 405, String(out.status))
+
+  const allowRoute = fleet.webServer.routes.get(ALLOW_PATH)
+  check('清单路由已注册（exact）', allowRoute !== undefined && allowRoute.kind === 'exact')
+  out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-aaaa', headers: HOST })
+  check('未设清单时 unrestricted=true', out.status === 200 && JSON.parse(out.body).unrestricted === true, out.body)
+  runCommand(fleet, fleet.A, 'allow session-bbbb')
+  out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-aaaa', headers: HOST })
+  const allow = JSON.parse(out.body)
+  check('设了清单后返回 ids 真值', out.status === 200 && allow.unrestricted === false && JSON.stringify(allow.ids) === JSON.stringify(['session-bbbb']), out.body)
+  out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-nope', headers: HOST })
+  check('未知会话 404', out.status === 404, String(out.status))
+  out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH, headers: HOST })
+  check('缺 session 参数 400', out.status === 400, String(out.status))
+  out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-aaaa', headers: { host: 'evil.example.com' } })
+  check('清单路由：不可信 Host 403', out.status === 403, String(out.status))
+  out = await call(allowRoute, { method: 'POST', url: ALLOW_PATH, headers: HOST })
+  check('清单路由：非 GET/HEAD 405', out.status === 405, String(out.status))
 }
 
 console.log('\n' + (failures === 0 ? '全部通过 ✅' : failures + ' 项失败 ❌'))

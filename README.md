@@ -19,7 +19,7 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 - 异步友好：对端正在跑长任务时自动转异步，答复回来时自带**原问题原文 + 提问/答复时间 + 端到端耗时**，时间轴不会乱
 - 零开销：没有任何后台轮询；没有人调用工具时它什么都不做
 - **图形界面选目标**：输入框左侧的「会话总线」按钮可以**多选**本会话能通信的会话，不用再在对话里打字指定名字（见下）
-- 依赖极简：只用 DSH 既有的 `agents` / `tools` / `commands` / `sessionProjections` / `sessionTitle` / `timer` 服务，外加一个 `@deepseek-ai/schemastery`（投影单元的状态 schema，官方插件同款写法）
+- 依赖极简：只用 DSH 既有的 `agents` / `tools` / `commands` / `sessionProjections` / `sessionTitle` / `timer` 服务，外加一个 `zod`（投影单元的 stateSchema / wire.viewSchema —— 宿主契约要求的就是 zod schema，冷读时会直接调它的 `.parse`）
 
 ## 图形界面：多选可通信的会话
 
@@ -190,9 +190,11 @@ node test/smoke.mjs
 4. **异步消息必须自描述**：凡是可能「过了很久才到达」的消息，信封里就要带原问题、发出时间、到达时间与耗时，否则收方无法重建时间轴。
 5. **时间戳用本地时间**：用 UTC（`toISOString()`）会与 GUI 显示差一个时区，用户看到的时间轴就是错的。
 6. **静态插件必须把服务依赖写进 `inject`**：本包声明 `inject: ['timer', 'tools', 'agents']`。插件行在启动期是**并发激活**的，`tools`/`agents` 由别的插件行提供，`apply()` 执行时它们可能尚未注册 —— 只用 `ctx.get()` 会拿到 `undefined`，工具静默注册失败（日志：`tools 服务不可用`）。这个坑在动态插件里**看不到**，因为沙箱强制要求声明依赖；只有固化成静态插件后才会暴露。修法：声明 inject（Cordis 会等服务就绪再激活），可选服务（`sessionTitle`）改为惰性读取。
+7. **投影单元的 schema 必须是 zod，不能拿 schemastery 顶替**：`ProjectionDefinition.stateSchema` / `wire.viewSchema` 在契约里是 `ZodType`，宿主（dsh-session-projection 的 `restore()`，由 dsh-session-query 冷读历史会话时经 `hydrate()` 调用）会直接 `stateSchema.parse(row.val)` 与 `wire.viewSchema.parse(wire.view(state))`。schemastery 的 `Schema` 实例只有 `.resolve()` / `~standard`，**没有 `.parse`** → 抛 `def.wire.viewSchema.parse is not a function`，被 dsh-session-query 包成 `failed to project session "session-…"`，web 端表现为**所有会话的历史加载失败**（一个单元坏掉，整份投影读不出来）。官方插件同理：`dsh-tool-todo` 用 schemastery 写 `Config`、用 zod 写投影 schema。修法：投影 schema 换成 `z.object({...})`。
 
 ## 更新记录
 
+- **v0.2.1** — 修「投影 schema 用错库」导致的历史加载失败：`sessionBus` 投影的 `stateSchema` / `wire.viewSchema` 从 `@deepseek-ai/schemastery` 换成 `zod`（宿主契约是 `ZodType`，冷读时会调 `.parse`）。此前 web 端打开任何历史会话都会报 `failed to project session "session-…": def.wire.viewSchema.parse is not a function`。冒烟测试新增投影契约断言（防回归），运行时依赖由 schemastery 换成 zod。
 - **v0.2.0** — 新增浏览器半：输入框左侧「会话总线」多选面板 + `/session-bus allow|clear|all|list` 命令；允许清单由会话日志投影（`sessionBus` 的 `wire.view`）驱动，并作为 `peer_send` / `peer_ask` / `peer_list` / `peer_self` 的准入依据。新增 `@deepseek-ai/schemastery` 依赖（投影状态 schema）。
 - **v0.1.1** — 修静态化后的加载竞态：`tools`/`agents` 改为硬依赖（`inject`），`sessionTitle` 惰性读取。（v0.1.0 在真实宿主上会打印 `tools 服务不可用，插件未注册任何工具`）
 - **v0.1.0** — 首个版本：7 个工具、投递/答复双保险、本地时间轴、忙闲自适应、按会话对限速、撤回。

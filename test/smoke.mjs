@@ -11,7 +11,11 @@
  *   4. 兜底捕获：对端不调 peer_reply 时，靠 session/event 的 turn/end 自动取该轮最终文本；
  *   5. 忙闲自适应：对端 running 时按 busyWaitMs 短等待后返回 timeout；
  *   6. 目标不存在的报错、按会话对限速、撤回（含撤回仍在等待中的提问）；
- *   7. peer_inbox 的 thread 视图与本地时间。
+ *   7. peer_inbox 的 thread 视图与本地时间；
+ *   8. 投影单元契约：sessionBus 的 stateSchema / wire.viewSchema 具备宿主冷读
+ *      （dsh-session-projection 的 hydrate() → restore()）会调用的 .parse，
+ *      且 wire.view 的结果能通过校验 —— 用 schemastery 顶替 zod 会在这一步炸成
+ *      `def.wire.viewSchema.parse is not a function`。
  *
  * 每个用例用独立宿主，避免共享限速窗口互相干扰。
  */
@@ -317,6 +321,29 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('命令已注册', commands.defs.has('session-bus'))
   check('投影单元已注册', projections.units.has('sessionBus'))
 
+  // 宿主投影契约：dsh-session-projection 冷读历史会话时（hydrate → restore）会直接调
+  // def.stateSchema.parse(row.val) 与 def.wire.viewSchema.parse(def.wire.view(state))，
+  // 契约类型也是 ZodType —— 只能是 zod schema，schemastery 实例没有 .parse。
+  const unit = projections.units.get('sessionBus')
+  check('stateSchema 具备宿主契约要求的 .parse', typeof unit.stateSchema?.parse === 'function')
+  check('wire.viewSchema 具备宿主契约要求的 .parse', typeof unit.wire?.viewSchema?.parse === 'function')
+  const folded = projections.stateOf(A.session, 'sessionBus')
+  let parsedWire = null
+  try { parsedWire = unit.wire.viewSchema.parse(unit.wire.view(folded)) } catch (err) { parsedWire = err }
+  check('wire.view 结果能通过 viewSchema.parse（冷读路径）',
+    parsedWire !== null && !(parsedWire instanceof Error)
+      && Array.isArray(parsedWire.ids) && parsedWire.ids.length === folded.ids.length
+      && parsedWire.updatedAt === folded.updatedAt,
+    parsedWire instanceof Error ? parsedWire.message : JSON.stringify(parsedWire))
+  let rejected = false
+  try { unit.wire.viewSchema.parse({ ids: [1], updatedAt: 'x' }) } catch (err) { rejected = true }
+  check('viewSchema 拒绝非法 wire 值', rejected)
+  let seeded = null
+  try { seeded = unit.stateSchema.parse({}) } catch (err) { seeded = err }
+  check('stateSchema 校验（并补齐缺省）checkpoint 状态',
+    seeded !== null && !(seeded instanceof Error) && Array.isArray(seeded.ids) && seeded.ids.length === 0 && seeded.updatedAt === 0,
+    seeded instanceof Error ? seeded.message : JSON.stringify(seeded))
+
   // 投影只在本插件命令的改动型输入上改写状态
   projections.drive(A.session, { type: 'command/run', seq: 1, time: 1, data: { name: 'other-command', args: 'allow session-cccc' } })
   check('忽略其它命令的事件', projections.stateOf(A.session, 'sessionBus').ids.length === 0)
@@ -356,7 +383,9 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   out = runCommand(fleet, A, 'frobnicate')
   check('未知参数回执为错误', out.kind === 'error' && out.text.includes('未知参数'), JSON.stringify(out))
   out = runCommand(fleet, A, 'allow 不存在的会话名')
-  check('无法解析的 token 会说明', out.kind === 'error' && out.text.includes('未能解析'), JSON.stringify(out))
+  check('未打开的会话先记账并在回执里说明', out.kind === 'success' && out.text.includes('当前未打开'), JSON.stringify(out))
+  out = runCommand(fleet, A, 'allow session-bbbb 不存在的会话名')
+  check('回执区分「现在就能通信」与「当前未打开」', out.text.includes('现在就能通信') && out.text.includes('当前未打开'), JSON.stringify(out))
 }
 
 console.log('\n' + (failures === 0 ? '全部通过 ✅' : failures + ' 项失败 ❌'))

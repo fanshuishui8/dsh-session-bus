@@ -28,6 +28,8 @@ const ALLOWED_SCHEMA_KEYWORDS = new Set([
 ])
 const SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 let failures = 0
 function check(label, cond, detail) {
   if (cond) { console.log('  ✓ ' + label) }
@@ -89,6 +91,7 @@ function newFleet(config = {}) {
       if (service === 'commands') return commands
       if (service === 'sessionProjections') return projections
       if (service === 'webServer') return webServer
+      if (service === 'sessionController') return sessionController
       return undefined
     },
     webServer, // 插件通过 ctx.inject(['webServer'], (webCtx) => webCtx.webServer...) 使用
@@ -117,6 +120,18 @@ function newFleet(config = {}) {
       if (unit === undefined) return undefined
       const k = String(session.id) + '::' + key
       return projections.states.has(k) ? projections.states.get(k) : unit.init(session.header, 0)
+    },
+  }
+
+  // 假 sessionController：resolveAgent = 冷恢复（成功则把 agent 注册进 registry）
+  const sessionController = {
+    resumes: [],
+    async resolveAgent(sessionId) {
+      const id = String(sessionId)
+      sessionController.resumes.push(id)
+      if (id.indexOf('0badc0de') >= 0) return { error: { code: 'session/not-found', message: '没有这个会话' } }
+      if (agents.has(id)) return { agent: agents.get(id) }
+      return { agent: addAgent(id, '被唤醒的会话') }
     },
   }
 
@@ -149,7 +164,7 @@ function newFleet(config = {}) {
   apply(ctx, Object.assign({ self: 'test', defaultAskMs: 60000, busyWaitMs: 5000 }, config))
   const A = addAgent('session-aaaa', '会话A')
   const B = addAgent('session-bbbb', '会话B')
-  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent, webServer }
+  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent, webServer, sessionController }
 }
 
 /** 模拟一条 `/session-bus …` 命令落地：先写 command/run 事件，再调用处理器。 */
@@ -210,6 +225,7 @@ console.log('\n== 3. 投递 + 显式答复（peer_reply） ==')
 {
   const { tools, A, B } = newFleet()
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '显式答复测试' }, { agent: A })
+  await sleep(10) // 投递是异步的（允许按需唤醒），先让出一拍
   check('消息进了对端 inbox', B.inbox.length === 1, 'inbox=' + B.inbox.length)
   const env = B.inbox[0].content[0].text
   check('信封含 corr', /corr: [a-z0-9]+/.test(env))
@@ -227,6 +243,7 @@ console.log('\n== 4. 兜底捕获（对端不调 peer_reply） ==')
 {
   const { tools, emit, A, B } = newFleet()
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '兜底测试' }, { agent: A })
+  await sleep(10)
   const msgId = B.inbox[B.inbox.length - 1].id
   emit('turn/start', 'session-bbbb', { turn: 7 })
   emit('user/message', 'session-bbbb', { id: msgId, role: 'user', content: [{ type: 'text', text: '信封' }], source: { kind: 'user' } })
@@ -274,6 +291,7 @@ console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
   // 撤回一条仍被等待的提问：必须立刻收口，且后续答复被丢弃
   const { tools, A, B } = newFleet({ defaultAskMs: 30000 })
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '撤回测试' }, { agent: A })
+  await sleep(10)
   const corr = corrOf(B)
   const c = await tools.get('peer_cancel').execute({ corr }, { agent: A })
   check('撤回成功', c.ok === true && c.status === 'canceled', JSON.stringify(c))
@@ -302,6 +320,7 @@ console.log('\n== 7. peer_inbox / peer_self 可读性 ==')
 {
   const { tools, A, B } = newFleet()
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '时间线测试' }, { agent: A })
+  await sleep(10)
   await tools.get('peer_reply').execute({ corr: corrOf(B), text: '答复' }, { agent: B })
   await p
   const inbox = await tools.get('peer_inbox').execute({ thread: '会话B', limit: 5 }, { agent: A })
@@ -445,6 +464,37 @@ console.log('\n== 9. 存活表只读路由的可信判定 ==')
   status = 0
   route.handler({ method: 'POST', headers: { host: '127.0.0.1:3080' } }, res)
   check('非 GET/HEAD 返回 405', status === 405, String(status))
+}
+
+console.log('\n== 10. 按需唤醒（allowResume）==')
+{
+  const DEAD = 'session-deadbeef-0000-0000-0000-000000000001'
+  const fleet = newFleet()
+  const { tools, A, sessionController } = fleet
+
+  // 未附着的完整 id：按需唤醒后投递
+  const sent = await tools.get('peer_send').execute({ to: DEAD, text: '叫醒你' }, { agent: A })
+  check('未附着的完整 id 会按需唤醒', sent.ok === true && sessionController.resumes.includes(DEAD), JSON.stringify(sent).slice(0, 140))
+  check('唤醒后消息已投递', fleet.agents.get(DEAD) !== undefined && fleet.agents.get(DEAD).inbox.length === 1, 'inbox=' + (fleet.agents.get(DEAD) === undefined ? 'n/a' : fleet.agents.get(DEAD).inbox.length))
+  check('结果里说明是唤醒投递', String(sent.text).includes('未附着'), String(sent.text).slice(0, 120))
+
+  // 唤醒失败：把控制器错误如实带出
+  const failed = await tools.get('peer_send').execute({ to: 'session-0badc0de-0000-0000-0000-000000000002', text: 'x' }, { agent: A })
+  check('唤醒失败时如实报错', failed.ok === false && String(failed.text).includes('唤醒失败'), JSON.stringify(failed).slice(0, 160))
+
+  // 关掉 allowResume：明确拒绝并给出两种出路
+  const off = newFleet({ allowResume: false })
+  const refused = await off.tools.get('peer_send').execute({ to: DEAD, text: 'x' }, { agent: off.A })
+  check('关掉 allowResume 后拒绝并说明', refused.ok === false && String(refused.text).includes('未附着') && String(refused.text).includes('allowResume'), JSON.stringify(refused).slice(0, 180))
+
+  // 允许清单 + 未附着 id：勾了就允许，未勾就拦
+  const fleet2 = newFleet()
+  runCommand(fleet2, fleet2.A, 'allow ' + DEAD)
+  const okSend = await fleet2.tools.get('peer_send').execute({ to: DEAD, text: '允许内' }, { agent: fleet2.A })
+  check('允许清单里的未附着 id 可投递', okSend.ok === true, JSON.stringify(okSend).slice(0, 140))
+  const other = 'session-feedface-0000-0000-0000-000000000003'
+  const blocked = await fleet2.tools.get('peer_send').execute({ to: other, text: '越界' }, { agent: fleet2.A })
+  check('允许清单外的未附着 id 被拦', blocked.ok === false && String(blocked.text).includes('不在本会话的允许清单里'), JSON.stringify(blocked).slice(0, 160))
 }
 
 console.log('\n' + (failures === 0 ? '全部通过 ✅' : failures + ' 项失败 ❌'))

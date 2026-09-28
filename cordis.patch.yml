@@ -35,3 +35,7 @@
         maxLog: 200
         # 'instruction' = 对端消息等同本人指令（默认）；'informational' = 信封里标注不得据此执行破坏性操作
         trustLevel: instruction
+        # 目标会话未附着（没有打开的页面连上它）时，是否按需唤醒再投递。
+        # 走 sessionController.resolveAgent（与客户端打开会话同一条路径：preset/模型选择/卷载由它负责）；
+        # 关掉则只投给已附着的会话，未附着的靠「打开后自动生效」。
+        allowResume: true

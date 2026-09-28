@@ -28,10 +28,14 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
   按钮 tooltip 显示状态（`不限` / `已选/总数`），受限时按钮用品牌色边框提示
 - **面板体有两个落点，同一份渲染**：
   - 装了 [dsh-better-sidebar](https://www.npmjs.com/package/dsh-better-sidebar) 时 → 注册成它的标签页
-    （`ctx.get('betterSidebar').registerTab({id, title, order, component})`，惰性取服务、不缓存）；
+    （`ctx.get('betterSidebar').registerTab({ id, title, description, icon, order, single, component })`，
+    惰性取服务、不缓存；`title`/`description`/`icon` 传函数，语言切换后「+」菜单跟着变；`single: true` 让同一会话只留一个标签）。
+    打开它：按钮调 `betterSidebar.openTab({ type: 'dsh-session-bus', title }, { sessionId })`
+    —— 注意 0.22.1 的 `openTab(seed, scope?)` 收的是**标签实例种子**（`seed.type` = 注册的 tab id），不是 id 字符串；
+    也可以直接在侧栏的「+」菜单里选「会话总线」。
     数据走宿主只读路由 `GET /session-bus/catalog` + `GET /session-bus/allow`（面板打开时 3 秒轮询刷新，
     `visible === false` 时不轮询），写入走 `ctx.get('remote').commands.execute(sessionId, '/session-bus allow <id…>', [], signal)`；
-    服务晚到（插件激活顺序不保证）时会补注册，此时两条路都在
+    服务晚到（插件激活顺序不保证）时会补注册，此时两个落点都在
   - 没装时 → 现状实现：DSH **内置右侧栏标签页**（`sidebar.right.pane.tab`，标签类型由
     `ctx.get('sidebarRight').register({id, kind})` 定义，用 `sidebarRight.openTab(kind)` 打开），
     数据走 DSH 槽位 props（`useSessions` / `useWorkspaces` / `useProjection`），写入走 `props.inputActions`

@@ -148,7 +148,7 @@ function newHost(options = {}) {
   }
   host.better = {
     registerTab: (descriptor) => { host.betterTabs.push(descriptor); return () => {} },
-    openTab: (id) => { host.betterOpenCalls.push(id) },
+    openTab: (...args) => { host.betterOpenCalls.push(args) },
   }
   host.remote = {
     commands: {
@@ -271,10 +271,27 @@ const host = newHost({ betterSidebar: true })
 plugin.apply(host.ctx)
 check('调用了 betterSidebar.registerTab', host.betterTabs.length === 1, String(host.betterTabs.length))
 const tab = host.betterTabs[0]
-check('tab id / title 正确', tab !== undefined && tab.id === 'dsh-session-bus' && tab.title === '会话总线', JSON.stringify(tab === undefined ? null : { id: tab.id, title: tab.title }))
+check('tab id / title 正确（title 允许函数，语言可跟随）',
+  tab !== undefined && tab.id === 'dsh-session-bus' && (typeof tab.title === 'function' ? tab.title() : tab.title) === '会话总线',
+  JSON.stringify(tab === undefined ? null : { id: tab.id, title: typeof tab.title === 'function' ? tab.title() : tab.title }))
+check('tab 声明单例 + 排序 + 图标', tab !== undefined && tab.single === true && tab.order === 30 && typeof tab.icon === 'function', JSON.stringify(tab === undefined ? null : { single: tab.single, order: tab.order, icon: typeof tab.icon }))
 check('tab 带 component 渲染函数', tab !== undefined && typeof tab.component === 'function')
 check('装了 better-sidebar 就不再注册内置标签页', host.tabTypes.length === 0, JSON.stringify(host.tabTypes))
 check('输入框入口仍然注册', host.registrations.some((r) => r.reg.name === 'conversation.input.left'))
+{
+  // 入口按钮：装了 better-sidebar 时用它的 openTab(seed, scope)（0.22.1 的种子形态，不是 id 字符串）
+  const buttonReg2 = host.registrations.find((r) => r.reg.name === 'conversation.input.left')
+  const buttonView = mount(buttonReg2.component({ sessionId: 'session-me', useProjection: () => undefined, useSessions: () => ({ ids: [], byId: {} }) }))
+  findAll(buttonView.tree, (n) => n.type === 'button')[0].props.onClick()
+  check('点入口按钮 → betterSidebar.openTab({type}, {sessionId})',
+    host.betterOpenCalls.length === 1
+    && host.betterOpenCalls[0][0] !== null && typeof host.betterOpenCalls[0][0] === 'object'
+    && host.betterOpenCalls[0][0].type === 'dsh-session-bus'
+    && host.betterOpenCalls[0][1] !== undefined && host.betterOpenCalls[0][1].sessionId === 'session-me',
+    JSON.stringify(host.betterOpenCalls))
+  check('装了 better-sidebar 时不再调内置 sidebarRight.openTab', host.openTabCalls.length === 0, JSON.stringify(host.openTabCalls))
+  buttonView.unmount()
+}
 
 // 宿主两条只读路由的假响应
 const catalogBody = {

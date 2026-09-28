@@ -20,7 +20,7 @@
  * 每个用例用独立宿主，避免共享限速窗口互相干扰。
  */
 
-import { apply, name, inject, parseSelection } from '../lib/index.js'
+import { apply, name, inject, parseSelection, isTrustedLiveRequest, LIVE_PATH } from '../lib/index.js'
 
 const ALLOWED_SCHEMA_KEYWORDS = new Set([
   'type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
@@ -75,6 +75,12 @@ function newFleet(config = {}) {
     roots: () => [...agents.values()],
   }
 
+  // 假 webServer：记录注册的精确路由，便于断言
+  const webServer = {
+    routes: new Map(),
+    register(route) { webServer.routes.set(route.path, route); return () => webServer.routes.delete(route.path) },
+  }
+
   const ctx = {
     get(service) {
       if (service === 'tools') return { register: (def) => { tools.set(def.name, def); return () => tools.delete(def.name) } }
@@ -82,8 +88,11 @@ function newFleet(config = {}) {
       if (service === 'sessionTitle') return { get: (session) => ({ title: session.__title }) }
       if (service === 'commands') return commands
       if (service === 'sessionProjections') return projections
+      if (service === 'webServer') return webServer
       return undefined
     },
+    webServer, // 插件通过 ctx.inject(['webServer'], (webCtx) => webCtx.webServer...) 使用
+    inject(services, callback) { callback(ctx); return () => {} },
     on(event, fn) { listeners.set(event, fn); return () => listeners.delete(event) },
     effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
     timeout(fn, ms) { const h = setTimeout(fn, ms); return () => clearTimeout(h) },
@@ -140,7 +149,7 @@ function newFleet(config = {}) {
   apply(ctx, Object.assign({ self: 'test', defaultAskMs: 60000, busyWaitMs: 5000 }, config))
   const A = addAgent('session-aaaa', '会话A')
   const B = addAgent('session-bbbb', '会话B')
-  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent }
+  return { ctx, tools, emit, A, B, agents, projections, commands, addAgent, webServer }
 }
 
 /** 模拟一条 `/session-bus …` 命令落地：先写 command/run 事件，再调用处理器。 */
@@ -405,6 +414,37 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('未打开的会话先记账并在回执里说明', out.kind === 'success' && out.text.includes('当前未打开'), JSON.stringify(out))
   out = runCommand(fleet, A, 'allow session-bbbb 不存在的会话名')
   check('回执区分「现在就能通信」与「当前未打开」', out.text.includes('现在就能通信') && out.text.includes('当前未打开'), JSON.stringify(out))
+}
+
+console.log('\n== 9. 存活表只读路由的可信判定 ==')
+{
+  check('路由路径固定', LIVE_PATH === '/session-bus/live')
+  check('loopback 127.0.0.1 放行', isTrustedLiveRequest({ host: '127.0.0.1:3080' }) === true)
+  check('localhost 放行', isTrustedLiveRequest({ host: 'localhost:3080' }) === true)
+  check('IPv6 loopback 放行', isTrustedLiveRequest({ host: '[::1]:3080' }) === true)
+  check('同源 Origin 放行', isTrustedLiveRequest({ host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' }) === true)
+  check('非 loopback Host 拒绝（DNS rebinding）', isTrustedLiveRequest({ host: 'evil.example.com' }) === false)
+  check('LAN 地址拒绝', isTrustedLiveRequest({ host: '10.131.71.187:3080' }) === false)
+  check('跨站请求拒绝', isTrustedLiveRequest({ host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' }) === false)
+  check('Origin 与 Host 不一致拒绝', isTrustedLiveRequest({ host: '127.0.0.1:3080', origin: 'http://evil.example.com' }) === false)
+  check('畸形 Origin 拒绝', isTrustedLiveRequest({ host: '127.0.0.1:3080', origin: 'not a url' }) === false)
+  check('空请求头拒绝', isTrustedLiveRequest({}) === false && isTrustedLiveRequest(undefined) === false)
+
+  // 用假 req/res 真正跑一次注册好的路由处理器
+  const fleet2 = newFleet()
+  const route = fleet2.webServer.routes.get(LIVE_PATH)
+  check('路由已注册到 webServer', route !== undefined && route.kind === 'exact')
+  let status = 0
+  let body = ''
+  const res = { writeHead(code) { status = code }, end(chunk) { if (typeof chunk === 'string') body = chunk } }
+  route.handler({ method: 'GET', headers: { host: '127.0.0.1:3080' } }, res)
+  check('可信 GET 返回 200 + 存活表', status === 200 && JSON.parse(body).live.includes('session-bbbb'), body)
+  status = 0
+  route.handler({ method: 'GET', headers: { host: 'evil.example.com' } }, res)
+  check('不可信 Host 返回 403', status === 403, String(status))
+  status = 0
+  route.handler({ method: 'POST', headers: { host: '127.0.0.1:3080' } }, res)
+  check('非 GET/HEAD 返回 405', status === 405, String(status))
 }
 
 console.log('\n' + (failures === 0 ? '全部通过 ✅' : failures + ' 项失败 ❌'))

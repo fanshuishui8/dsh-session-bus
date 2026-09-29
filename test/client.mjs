@@ -220,7 +220,7 @@ console.log('\n== 3. 内置版面板：分组与写入（走 inputActions） =='
     inputActions: { setDraft: (text) => sent.push(text), submit: () => sent.push('<submit>') },
     useProjection: () => ({ ids: ['session-a1'] }),   // 已勾选 A → 项目一 分组默认展开
     useSessions: () => ({
-      ids: ['session-me', 'session-a1', 'session-b1', 'session-c1', 'session-arch', 'session-sub'],
+      ids: ['session-me', 'session-b1', 'session-a1', 'session-c1', 'session-arch', 'session-sub'],   // 故意乱序：b1 更旧
       byId: {
         'session-me': { id: 'session-me', displayTitle: '我自己', running: false, updatedAt: Date.now(), origin: undefined },
         'session-a1': { id: 'session-a1', displayTitle: 'A 会话', running: true, updatedAt: Date.now() - 120000 },
@@ -246,6 +246,9 @@ console.log('\n== 3. 内置版面板：分组与写入（走 inputActions） =='
   check('展开的分组里列出该工作区的会话', texts.includes('A 会话') && texts.includes('B 会话'), JSON.stringify(texts))
   check('自己 / 归档 / subagent 不出现在面板里', !texts.includes('我自己') && !texts.includes('归档会话') && !texts.includes('子代理'), JSON.stringify(texts))
   check('分组计数显示 已选/总数', texts.includes('1/2'), JSON.stringify(texts))
+  check('内置版也按时间倒序（a1 比 b1 新）',
+    texts.indexOf('A 会话') < texts.indexOf('B 会话'),
+    'A@' + texts.indexOf('A 会话') + ' B@' + texts.indexOf('B 会话'))
   const checkboxes = findAll(view.tree, (n) => n.type === 'input' && n.props.type === 'checkbox')
   check('展开的分组里勾选框数量 = 该组会话数', checkboxes.length === 2, String(checkboxes.length))
   check('已勾选的会话被勾上', checkboxes.filter((c) => c.props.checked === true).length === 1, JSON.stringify(checkboxes.map((c) => c.props.checked)))
@@ -276,16 +279,18 @@ check('两个落点都不再调用侧栏的 openTab（入口交给侧栏自己�
   JSON.stringify({ sidebarRight: host.openTabCalls, betterSidebar: host.betterOpenCalls }))
 
 // 宿主两条只读路由的假响应
+const T = Date.now()
 const catalogBody = {
   session: 'session-me',
+  // 注意 sessionIds 里 a1 在前，但 a1 的 updatedAt 更早 → 面板应把 b1 排到前面
   workspaces: [{ workspaceId: 'ws-1', title: '项目一', path: '/tmp/one', sessionIds: ['session-a1', 'session-b1'] }],
   sessions: [
-    { id: 'session-a1', title: 'A 会话', running: true, attached: true, archived: false },
-    { id: 'session-b1', title: 'B 会话', running: false, attached: false, archived: false },
-    { id: 'session-orphan1', title: '孤儿会话', running: false, attached: false, archived: false },
-    { id: 'session-me', title: '我自己', running: true, attached: true, archived: false },
-    { id: 'session-arch', title: '归档会话', running: false, attached: false, archived: true },
-    { id: 'session-plain', title: '', running: false, attached: false, archived: false },
+    { id: 'session-a1', title: 'A 会话', running: true, attached: true, archived: false, updatedAt: T - 3 * 3600 * 1000 },
+    { id: 'session-b1', title: 'B 会话', running: false, attached: false, archived: false, updatedAt: T - 10 * 1000 },
+    { id: 'session-orphan1', title: '孤儿会话', running: false, attached: false, archived: false, updatedAt: T - 5 * 86400 * 1000 },
+    { id: 'session-me', title: '我自己', running: true, attached: true, archived: false, updatedAt: T },
+    { id: 'session-arch', title: '归档会话', running: false, attached: false, archived: true, updatedAt: T },
+    { id: 'session-plain', title: '', running: false, attached: false, archived: false, updatedAt: T - 2 * 60 * 1000 },
   ],
 }
 const allowBody = { session: 'session-me', ids: ['session-a1'], unrestricted: false }
@@ -321,6 +326,12 @@ check('允许清单真值决定勾选（allow 路由的 session-a1）', findAll(
   const expanded = textsOf(view.tree)
   check('孤儿会话进「未分组」', expanded.includes('孤儿会话'), JSON.stringify(expanded))
   check('没有标题的会话退化为 id', expanded.includes('session-plain'), JSON.stringify(expanded))
+  check('行上显示相对时间（官方口径的 updatedAt）',
+    expanded.includes('刚刚') && expanded.includes('3 小时') && expanded.includes('5 天') && expanded.includes('2 分钟'),
+    JSON.stringify(expanded.filter((x) => /刚刚|小时|天|分钟/.test(x))))
+  check('组内按时间倒序（b1 比 a1 新，应排在前）',
+    expanded.indexOf('B 会话') < expanded.indexOf('A 会话'),
+    'B@' + expanded.indexOf('B 会话') + ' A@' + expanded.indexOf('A 会话'))
   check('面板不再依赖 DSH 槽位 props（没有 useSessions 也能渲染出行）',
     findAll(view.tree, (n) => n.type === 'input' && n.props.type === 'checkbox').length === 4,
     String(findAll(view.tree, (n) => n.type === 'input' && n.props.type === 'checkbox').length))

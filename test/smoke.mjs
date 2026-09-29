@@ -103,6 +103,15 @@ function newFleet(config = {}) {
     list() { return workspaceRegistry.workspaces },
   }
 
+  // 假 sessionProjectionCache：冷会话的「最后活动时间」来源（header.createdAt 之外的信息）
+  const sessionProjectionCache = {
+    cachedSnapshot(header) {
+      const at = header !== undefined && header !== null ? header.__lastPromptAt : undefined
+      if (typeof at !== 'number') return undefined
+      return { asOfSeq: 1, values: { sessionListMetadata: { lastPromptAt: at } } }
+    },
+  }
+
   // 假 sessionQuery：listSessions = 持久化目录；readTitleSnapshots = 未附着会话的批量标题观测
   const sessionQuery = {
     reads: [],
@@ -142,6 +151,7 @@ function newFleet(config = {}) {
       if (service === 'sessions') return sessionsStore
       if (service === 'workspaceRegistry') return workspaceRegistry
       if (service === 'sessionQuery') return sessionQuery
+      if (service === 'sessionProjectionCache') return sessionProjectionCache
       return undefined
     },
     webServer, // 插件通过 ctx.inject(['webServer'], (webCtx) => webCtx.webServer...) 使用
@@ -152,9 +162,15 @@ function newFleet(config = {}) {
   }
 
   // 假投影注册表：够用来验证「命令事件 → 允许清单」的折叠与读取
+  // cachedSnapshot 用来喂「最后活动时间」的口径（sessionListMetadata.lastPromptAt）
   const projections = {
     units: new Map(),
     states: new Map(),
+    cachedSnapshot(session) {
+      const at = session !== undefined && session !== null ? session.__lastPromptAt : undefined
+      if (typeof at !== 'number') return undefined
+      return { asOfSeq: 1, values: { sessionListMetadata: { lastPromptAt: at } } }
+    },
     register(definition) { projections.units.set(definition.key, definition); return () => projections.units.delete(definition.key) },
     /** 测试辅助：把一个会话事件喂给所有单元（引用不变则视为未改动）。 */
     drive(session, event) {
@@ -580,13 +596,19 @@ console.log('\n== 11. 面板只读路由：catalog / allow ==')
 
   const fleet = newFleet({ defaultAskMs: 50 })
   fleet.B.status = 'running'
+  fleet.B.session.__lastPromptAt = 1_700_000_000_123   // 比 createdAt（Date.now()）小？不影响断言：取 max 后应等于它或 createdAt
+  fleet.B.session.header.createdAt = 1_600_000_000_000 // 让 lastPromptAt 明确更大
   const SUB = fleet.addAgent('session-sub123', '子代理')
   SUB.session.header.origin = 'subagent'
+  const D = fleet.addAgent('session-dddd', '会话D')   // 没有 lastPromptAt 元数据 → 时间应退化为 createdAt
+  D.session.header.createdAt = 1_234_567_890_000
   fleet.setWorkspaces([
-    { id: 'ws-1', title: '项目一', path: '/tmp/one', sessionIds: ['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1'] },
+    { id: 'ws-1', title: '项目一', path: '/tmp/one', sessionIds: ['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1', 'session-dddd'] },
     { id: 'ws-2', title: '项目二', path: '/tmp/two', sessionIds: ['session-cold2', 'session-sub123'] },
   ], ['session-cold2'])
-  fleet.addColdSession('session-cold1')
+  const cold1 = fleet.addColdSession('session-cold1')
+  cold1.header.__lastPromptAt = 1_650_000_000_456
+  cold1.header.createdAt = 1000
   fleet.addColdSession('session-cold2')
   fleet.addColdSession('session-orphan1')   // 不属于任何工作区：面板会把它显示成「未分组」
 
@@ -598,7 +620,7 @@ console.log('\n== 11. 面板只读路由：catalog / allow ==')
   check('目录含工作区（workspaceId/标题/path/sessionIds）',
     Array.isArray(cat.workspaces) && cat.workspaces.length === 2
     && cat.workspaces[0].workspaceId === 'ws-1' && cat.workspaces[0].title === '项目一' && cat.workspaces[0].path === '/tmp/one'
-    && JSON.stringify(cat.workspaces[0].sessionIds) === JSON.stringify(['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1']),
+    && JSON.stringify(cat.workspaces[0].sessionIds) === JSON.stringify(['session-bbbb', 'session-cold1', 'session-notitle1', 'session-bad1', 'session-ghost1', 'session-dddd']),
     JSON.stringify(cat.workspaces))
   const rows = new Map(cat.sessions.map((r) => [r.id, r]))
   check('自己不出现在目录里', rows.has('session-aaaa') === false, JSON.stringify([...rows.keys()]))
@@ -611,9 +633,18 @@ console.log('\n== 11. 面板只读路由：catalog / allow ==')
   check('工作区里登记但读不到 header 的会话也会列出', rows.has('session-ghost1') === true, JSON.stringify([...rows.keys()]))
   check('不属于任何工作区的历史会话也列出（面板显示为「未分组」）', rows.has('session-orphan1') === true, JSON.stringify([...rows.keys()]))
   check('目录行的字段是白名单（无 cwd / 事件 / 日志）',
-    Object.keys(rows.get('session-bbbb')).sort().join(',') === 'archived,attached,id,running,title',
+    Object.keys(rows.get('session-bbbb')).sort().join(',') === 'archived,attached,id,running,title,updatedAt',
     Object.keys(rows.get('session-bbbb')).join(','))
   check('未附着标题一次批量读完', fleet.sessionQuery.reads.length === 1 && fleet.sessionQuery.reads[0].length === 6, JSON.stringify(fleet.sessionQuery.reads))
+
+  // 「最后活动时间」= 官方口径 max(createdAt, sessionListMetadata.lastPromptAt)
+  check('附着会话：活动时间取自投影的 lastPromptAt', rows.get('session-bbbb').updatedAt === 1_700_000_000_123, String(rows.get('session-bbbb').updatedAt))
+  check('附着但没有活动元数据时退化为 createdAt',
+    rows.get('session-dddd') !== undefined && rows.get('session-dddd').updatedAt === rows.get('session-dddd').updatedAt
+    && rows.get('session-dddd').updatedAt === D.session.header.createdAt,
+    JSON.stringify(rows.get('session-dddd')))
+  check('冷会话：活动时间取自投影缓存', rows.get('session-cold1').updatedAt === 1_650_000_000_456, String(rows.get('session-cold1').updatedAt))
+  check('冷会话没有缓存时退化为 createdAt', rows.get('session-ghost1').updatedAt === 1000, String(rows.get('session-ghost1').updatedAt))
 
   out = await call(catalogRoute, { method: 'GET', url: CATALOG_PATH + '?session=session-aaaa', headers: HOST })
   check('TTL 内不重复读未附着会话标题', fleet.sessionQuery.reads.length === 1, String(fleet.sessionQuery.reads.length))

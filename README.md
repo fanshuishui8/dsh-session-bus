@@ -40,7 +40,7 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
   - 没装时 → 现状实现：DSH **内置右侧栏标签页**（`sidebar.right.pane.tab`，标签类型由
     `ctx.get('sidebarRight').register({id, kind})` 定义，用 `sidebarRight.openTab(kind)` 打开），
     数据走 DSH 槽位 props（`useSessions` / `useWorkspaces` / `useProjection`），写入走 `props.inputActions`
-- 面板内：会话**按工作区分组、可折叠**（与侧边栏一致），行上是标题（+ 内置版还有相对时间），正在运行的带黄点；
+- 面板内：会话**按工作区分组、可折叠**（与侧边栏一致），**组内按最后活动时间倒序**，行上是标题 + 相对时间，正在运行的带黄点；
   已勾选的分组默认展开；归档与 subagent 会话不列
 - **不限 / 清空 / 应用 / 取消**：点「应用」会替你提交 `/session-bus allow <会话id…>`
   （或 `/session-bus clear`），回执说明「现在就能通信 / 当前未打开（打开后自动生效）」
@@ -60,7 +60,7 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 | 路由 | 返回 | 说明 |
 | --- | --- | --- |
 | `GET /session-bus/live` | `{live: [会话id], at}` | 宿主当前存活的顶层会话 id（诊断用） |
-| `GET /session-bus/catalog?session=<id>` | `{session, workspaces, sessions, at}` | 面板目录。工作区给 `workspaceId/标题/path/sessionIds`，会话只给 `id/标题/running/attached/归档` —— **字段白名单，不透出 cwd、事件、日志内容**；`session` 参数只用于剔除自己 |
+| `GET /session-bus/catalog?session=<id>` | `{session, workspaces, sessions, at}` | 面板目录。工作区给 `workspaceId/标题/path/sessionIds`，会话只给 `id/标题/running/attached/归档/updatedAt` —— **字段白名单，不透出 cwd、事件、日志内容**；`updatedAt` 与官方会话列表同口径（`max(header.createdAt, sessionListMetadata.lastPromptAt)`）；`session` 参数只用于剔除自己 |
 | `GET /session-bus/allow?session=<id>` | `{session, ids, unrestricted, at}` | 该会话允许清单的**真值**（就是 `selectionOf()` 的结果）；缺参数 400，会话不在本进程 404 |
 
 实现细节：会话目录 = `workspaceRegistry.list()` ∪ `ctx.sessions.list()` ∪ `sessionQuery.listSessions()`
@@ -93,19 +93,19 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 
 ```bash
 npm test                 # 两个套件都跑
-node test/smoke.mjs      # 宿主半：162 项
-node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
+node test/smoke.mjs      # 宿主半：166 项
+node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 ```
 
 `test/smoke.mjs` 用一个假宿主（假 `ctx` / `agents` / `sessions` / `workspaceRegistry` / `sessionQuery` /
-`sessionTitle` / `tools` / `timer` / `webServer`）跑 162 项检查，覆盖：工具注册与 **schema 子集**
+`sessionTitle` / `tools` / `timer` / `webServer`）跑 166 项检查，覆盖：工具注册与 **schema 子集**
 （安装后最容易踩的加载期失败点）、投递、显式答复、兜底捕获、忙闲自适应、目标不存在、限速、撤回
 （含撤回仍在等待中的提问）、超时后迟到答复注入、`peer_inbox` 时间线、投影单元契约（zod 的 `.parse` 冷读路径）、
 以及三条只读路由的可信 200 / 不可信 403 / 非 `GET`/`HEAD` 405 / 缺参 400 / 未知会话 404、
-目录字段白名单、未附着标题批量读取与 TTL 缓存。
+目录字段白名单、未附着标题批量读取与 TTL 缓存、「最后活动时间」的官方口径（`lastPromptAt` 优先、缺失退化为 `createdAt`）。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
-假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 46 项检查：模块与插件形状、内置落点的注册
+假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册
 （**不再往输入框插按钮**）、内置版面板的分组与 `inputActions` 写入、better-sidebar 落点的 `registerTab`
 （函数标题 / 单例 / 图标 / 晚到补注册）、
 面板数据确实来自 `/session-bus/catalog` + `/session-bus/allow`（没有任何槽位 props） 、
@@ -139,8 +139,6 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 ## 已知限制
 
 - **单进程**：两个会话必须在同一个 `dsh` 进程里（同一台 `dsh web`）。
-- **better-sidebar 落点不显示「相对时间」**：宿主目录路由只给 id/标题/running/归档，
-  宁可不显示也不显示错的。
 - **内存态**：往来记录、待答复关联只在内存里；进程重启后旧的 `corr` 不再可答复（会明确报「找不到 corr」）。
 - **不唤醒冷会话**：目标必须存活；不会自动 resume（避免抢占用户会话/挂错 preset）。
 - **会消耗 token**：被唤醒的对端会真实跑一轮模型。
@@ -168,6 +166,13 @@ node test/client.mjs     # 浏览器半：46 项（不需要浏览器）
 11. **dotted 服务名只能用反射 `get` 取，不能点属性**：Cordis 里 `remote.commands` 是注册名就叫 `remote.commands` 的服务（`super(ctx, remoteServiceKey(name))`），而 `ctx.get('remote')` 返回的是 **traceable 代理** —— 在它上面点 `.commands` 会被代理当成**属性访问**，走 `internal/get` 的纤维回溯，要求访问方 fiber 在 `inject` 里声明过该服务，否则抛 `cannot get property "remote.commands" without inject`。三种写法里只有 `ctx.get('remote.commands')`（反射 get，直接查 store）无条件可用。这个坑在假宿主里看不出来（假 ctx 往往就是普通对象），本包 v0.3.5 就是这样带着全绿测试上了真机、被用户点「应用」时炸出来的：**凡是跨服务的取用，假宿主都要照抄真规则**。
 
 ## 更新记录
+
+- **v0.3.8** — 面板补上「最后活动时间」：`GET /session-bus/catalog` 的会话行新增 `updatedAt`，
+  口径与官方会话列表**完全一致**（`max(header.createdAt, sessionListMetadata.lastPromptAt)`，
+  附着会话读内存投影、未附着读投影缓存，取不到就退化为 `createdAt`，并按 TTL 缓存）；
+  两个落点的面板都显示相对时间，且**组内按时间倒序**（时间相同保持原顺序）。
+  这样 better-sidebar 落点不再因为「拿不到时间」而比内置落点少一列。
+  测试：宿主 162 → 166 项，浏览器 45 → 49 项。
 
 - **v0.3.7** — 修真机 bug：**「应用」报 `cannot get property "remote.commands" without inject`**。
   现象：在 better-sidebar 面板里勾选会话点「应用」，面板底部如实显示这条错误，允许清单没写进去。

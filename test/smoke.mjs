@@ -211,14 +211,33 @@ function newFleet(config = {}) {
     const agent = {
       id, status,
       session: { id, header: { createdAt: Date.now(), cwd: '/tmp' }, __title: title },
-      // 兼容旧断言：所有投递都进 inbox；同时分别记录走了哪个原语。
-      // 真 Agent.inbox 是 Inbox 对象（有 nextTurn/nextStep 数组）——isBusy 会读 nextTurn，
-      // 测试里给数组挂一个 nextTurn 属性即可模拟「还压着待处理的一轮」。
-      inbox: [], injected: [], turns: [], steps: [],
-      followup(msg) { agent.inbox.push(msg); agent.turns.push(msg) },
-      steer(msg) { agent.inbox.push(msg); agent.steps.push(msg) },
+      // 兼容旧断言：所有投递都进 delivered；同时分别记录走了哪个原语。
+      // inbox 做成「像真 Inbox 对象」：有 nextTurn/nextStep 数组（isBusy 读它）+ remove(msgId)。
+      delivered: [], injected: [], turns: [], steps: [],
+      cancelled: [],
+      followup(msg) { agent.delivered.push(msg); agent.turns.push(msg); agent.inbox.nextTurn.push(msg) },
+      steer(msg) { agent.delivered.push(msg); agent.steps.push(msg); agent.inbox.nextStep.push(msg) },
       inject(msg) { agent.injected.push(msg) },
+      cancel(cause, options) {
+        const keep = options !== undefined && options !== null && options.keepInbox === true
+        agent.cancelled.push({ cause, keepInbox: keep })
+        if (!keep) { agent.inbox.nextTurn.length = 0; agent.inbox.nextStep.length = 0 }
+      },
     }
+    // 真 Inbox：nextTurn/nextStep 两个待处理队列 + 逐条 remove
+    agent.inbox = {
+      nextTurn: [], nextStep: [],
+      remove(messageId) {
+        for (const list of [agent.inbox.nextTurn, agent.inbox.nextStep]) {
+          const at = list.findIndex((m) => m !== undefined && m !== null && m.id === messageId)
+          if (at >= 0) { list.splice(at, 1); return true }
+        }
+        return false
+      },
+      clear() { agent.inbox.nextTurn.length = 0; agent.inbox.nextStep.length = 0 },
+    }
+    // 旧断言读的是 agent.delivered.length（数组语义）→ 用 delivered 的别名兼容
+    Object.defineProperty(agent, 'inboxLegacyCount', { get: () => agent.delivered.length })
     agents.set(id, agent)
     return agent
   }
@@ -252,17 +271,19 @@ function newFleet(config = {}) {
 }
 
 /** 模拟一条 `/session-bus …` 命令落地：先写 command/run 事件，再调用处理器。 */
-function runCommand(fleet, agent, args) {
+async function runCommand(fleet, agent, args) {
   const session = agent.session
   fleet.emitRaw = fleet.emitRaw || null
   const unitEvent = { type: 'command/run', seq: 10000 + (runCommand.seq = (runCommand.seq || 0) + 1), time: Date.now(), data: { commandId: 'c' + runCommand.seq, name: 'session-bus', args, source: 'ui' } }
   fleet.projections.drive(session, unitEvent)
   const def = fleet.commands.defs.get('session-bus')
-  return def === undefined ? { kind: 'error', text: '命令未注册' } : def.handler({ commandId: 'c', agent, rawInput: args, attachments: [], signal: undefined })
+  if (def === undefined) return { kind: 'error', text: '命令未注册' }
+  // 真宿主的命令执行是异步的（recall 要 await），测试照抄这一形态
+  return await def.handler({ commandId: 'c', agent, rawInput: args, attachments: [], signal: undefined })
 }
 
 function corrOf(agent, index = -1) {
-  const msg = index < 0 ? agent.inbox[agent.inbox.length + index] : agent.inbox[index]
+  const msg = index < 0 ? agent.delivered[agent.delivered.length + index] : agent.delivered[index]
   const m = /corr: ([a-z0-9]+)/.exec(msg.content[0].text)
   return m === null ? '' : m[1]
 }
@@ -282,10 +303,10 @@ for (const svc of ['timer', 'tools', 'agents']) {
   check('inject 声明 ' + svc, Array.isArray(inject) && inject.includes(svc), JSON.stringify(inject))
 }
 
-const EXPECTED = ['peer_self', 'peer_list', 'peer_send', 'peer_ask', 'peer_reply', 'peer_cancel', 'peer_inbox']
+const EXPECTED = ['peer_self', 'peer_list', 'peer_send', 'peer_ask', 'peer_reply', 'peer_cancel', 'peer_recall', 'peer_stop', 'peer_inbox']
 {
   const { tools } = newFleet()
-  check('注册了 7 个工具', tools.size === EXPECTED.length, '实际 ' + tools.size)
+  check('注册了 9 个工具', tools.size === EXPECTED.length, '实际 ' + tools.size)
   for (const tn of EXPECTED) check('工具存在: ' + tn, tools.has(tn))
 }
 
@@ -314,8 +335,8 @@ console.log('\n== 3. 投递 + 显式答复（peer_reply） ==')
   const { tools, A, B } = newFleet()
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '显式答复测试' }, { agent: A })
   await sleep(10) // 投递是异步的（允许按需唤醒），先让出一拍
-  check('消息进了对端 inbox', B.inbox.length === 1, 'inbox=' + B.inbox.length)
-  const env = B.inbox[0].content[0].text
+  check('消息进了对端 inbox', B.delivered.length === 1, 'inbox=' + B.delivered.length)
+  const env = B.delivered[0].content[0].text
   check('信封含 corr', /corr: [a-z0-9]+/.test(env))
   check('信封标了提问类型', env.includes('提问（对方在等答复）'))
   check('信封用本地时间', /\d{2}:\d{2}:\d{2}[+-]\d{2}/.test(env))
@@ -332,7 +353,7 @@ console.log('\n== 4. 兜底捕获（对端不调 peer_reply） ==')
   const { tools, emit, A, B } = newFleet()
   const p = tools.get('peer_ask').execute({ to: 'session-bbbb', text: '兜底测试' }, { agent: A })
   await sleep(10)
-  const msgId = B.inbox[B.inbox.length - 1].id
+  const msgId = B.delivered[B.delivered.length - 1].id
   emit('turn/start', 'session-bbbb', { turn: 7 })
   emit('user/message', 'session-bbbb', { id: msgId, role: 'user', content: [{ type: 'text', text: '信封' }], source: { kind: 'user' } })
   emit('assistant/message', 'session-bbbb', { turn: 7, step: 1, message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: '中间过程' }] } })
@@ -389,7 +410,7 @@ console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
   check('撤回后 peer_ask 立刻收口（不再挂住）', got.status === 'canceled', JSON.stringify(got))
   const r = await tools.get('peer_reply').execute({ corr, text: '迟到答复' }, { agent: B })
   check('撤回后对端答复被丢弃', r.ok === false && r.text.includes('撤回'), JSON.stringify(r))
-  check('迟到答复没有注入提问方会话', A.inbox.length === 0, 'inbox=' + A.inbox.length)
+  check('迟到答复没有注入提问方会话', A.delivered.length === 0, 'inbox=' + A.delivered.length)
 }
 {
   // 超时后迟到答复：走异步注入，并带原问题与耗时
@@ -397,10 +418,10 @@ console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
   const p = host.tools.get('peer_ask').execute({ to: 'session-bbbb', text: '迟到答复测试' }, { agent: host.A })
   const got = await p
   check('先返回 timeout', got.status === 'timeout', JSON.stringify(got).slice(0, 120))
-  const msgId = host.B.inbox[host.B.inbox.length - 1].id
+  const msgId = host.B.delivered[host.B.delivered.length - 1].id
   finishTurn(host, 'session-bbbb', msgId, 3, '迟到的结论')
   await new Promise((r) => setTimeout(r, 20))
-  const injected = host.A.inbox.map((m) => m.content[0].text).join('\n')
+  const injected = host.A.delivered.map((m) => m.content[0].text).join('\n')
   check('迟到答复注入提问方会话', injected.includes('迟到的结论'), injected.slice(0, 160))
   check('迟到答复信封带原问题', injected.includes('你当时问的是') && injected.includes('迟到答复测试'), injected.slice(0, 300))
   check('迟到答复信封带耗时', /端到端耗时/.test(injected), injected.slice(0, 200))
@@ -491,7 +512,7 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('list 不改写状态', projections.stateOf(A.session, 'sessionBus').ids.length === 0)
 
   // 允许 B
-  let out = runCommand(fleet, A, 'allow session-bbbb')
+  let out = await runCommand(fleet, A, 'allow session-bbbb')
   check('命令回执成功', out.kind === 'success' && out.text.includes('已允许 1 个会话'), JSON.stringify(out))
   check('清单已折叠进投影', JSON.stringify(projections.stateOf(A.session, 'sessionBus').ids) === JSON.stringify(['session-bbbb']))
 
@@ -500,11 +521,11 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('允许清单内可投递', got.status === 'timeout' || got.status === 'answered', JSON.stringify(got).slice(0, 100))
   const blocked = await tools.get('peer_ask').execute({ to: 'session-cccc', text: '越界' }, { agent: A })
   check('清单外被拒绝', blocked.ok === false && blocked.text.includes('不在本会话的允许清单里'), JSON.stringify(blocked).slice(0, 160))
-  check('被拒绝时不投递', C.inbox.length === 0, 'inbox=' + C.inbox.length)
+  check('被拒绝时不投递', C.delivered.length === 0, 'inbox=' + C.delivered.length)
 
   // 'other' 优先选清单内的（C 更新，若不受限会选 C）
   const other = await tools.get('peer_send').execute({ to: 'other', text: '给允许的那个' }, { agent: A })
-  check('other 在受限时选清单内会话', other.ok === true && B.inbox.length >= 1 && C.inbox.length === 0, JSON.stringify(other).slice(0, 120))
+  check('other 在受限时选清单内会话', other.ok === true && B.delivered.length >= 1 && C.delivered.length === 0, JSON.stringify(other).slice(0, 120))
 
   // 列表与自述标注
   const list = await tools.get('peer_list').execute({}, { agent: A })
@@ -513,18 +534,18 @@ console.log('\n== 8. 允许清单：命令 / 投影折叠 / 准入 ==')
   check('peer_self 显示允许清单', self.text.includes('允许清单：1 个'), self.text.slice(0, 220))
 
   // 清空 / 不限 / 未知参数
-  out = runCommand(fleet, A, 'clear')
+  out = await runCommand(fleet, A, 'clear')
   check('clear 后不再限制', out.kind === 'success' && projections.stateOf(A.session, 'sessionBus').ids.length === 0)
   const free = await tools.get('peer_send').execute({ to: 'session-cccc', text: '解禁后可以发' }, { agent: A })
-  check('解禁后可投递', free.ok === true && C.inbox.length === 1, JSON.stringify(free).slice(0, 120))
-  out = runCommand(fleet, A, 'all')
+  check('解禁后可投递', free.ok === true && C.delivered.length === 1, JSON.stringify(free).slice(0, 120))
+  out = await runCommand(fleet, A, 'all')
   check('all → 状态存 *', projections.stateOf(A.session, 'sessionBus').ids[0] === '*')
   check('all 后 peer_self 报告未限制', (await tools.get('peer_self').execute({}, { agent: A })).text.includes('未限制'))
-  out = runCommand(fleet, A, 'frobnicate')
+  out = await runCommand(fleet, A, 'frobnicate')
   check('未知参数回执为错误', out.kind === 'error' && out.text.includes('未知参数'), JSON.stringify(out))
-  out = runCommand(fleet, A, 'allow 不存在的会话名')
+  out = await runCommand(fleet, A, 'allow 不存在的会话名')
   check('未打开的会话先记账并在回执里说明', out.kind === 'success' && out.text.includes('当前未打开'), JSON.stringify(out))
-  out = runCommand(fleet, A, 'allow session-bbbb 不存在的会话名')
+  out = await runCommand(fleet, A, 'allow session-bbbb 不存在的会话名')
   check('回执区分「现在就能通信」与「当前未打开」', out.text.includes('现在就能通信') && out.text.includes('当前未打开'), JSON.stringify(out))
 }
 
@@ -568,7 +589,7 @@ console.log('\n== 10. 按需唤醒（allowResume）==')
   // 未附着的完整 id：按需唤醒后投递
   const sent = await tools.get('peer_send').execute({ to: DEAD, text: '叫醒你' }, { agent: A })
   check('未附着的完整 id 会按需唤醒', sent.ok === true && sessionController.resumes.includes(DEAD), JSON.stringify(sent).slice(0, 140))
-  check('唤醒后消息已投递', fleet.agents.get(DEAD) !== undefined && fleet.agents.get(DEAD).inbox.length === 1, 'inbox=' + (fleet.agents.get(DEAD) === undefined ? 'n/a' : fleet.agents.get(DEAD).inbox.length))
+  check('唤醒后消息已投递', fleet.agents.get(DEAD) !== undefined && fleet.agents.get(DEAD).delivered.length === 1, 'inbox=' + (fleet.agents.get(DEAD) === undefined ? 'n/a' : fleet.agents.get(DEAD).delivered.length))
   check('结果里说明是唤醒投递', String(sent.text).includes('未附着'), String(sent.text).slice(0, 120))
 
   // 唤醒失败：把控制器错误如实带出
@@ -582,7 +603,7 @@ console.log('\n== 10. 按需唤醒（allowResume）==')
 
   // 允许清单 + 未附着 id：勾了就允许，未勾就拦
   const fleet2 = newFleet()
-  runCommand(fleet2, fleet2.A, 'allow ' + DEAD)
+  await runCommand(fleet2, fleet2.A, 'allow ' + DEAD)
   const okSend = await fleet2.tools.get('peer_send').execute({ to: DEAD, text: '允许内' }, { agent: fleet2.A })
   check('允许清单里的未附着 id 可投递', okSend.ok === true, JSON.stringify(okSend).slice(0, 140))
   const other = 'session-feedface-0000-0000-0000-000000000003'
@@ -649,6 +670,117 @@ console.log('\n== 10b. 投递原语：默认 auto（忙则合入当前轮，空�
   check('inbox 里已压着 next-turn 工作 → 走 steer 而不是再排一轮',
     queued.B.steps.length === 1 && queued.B.turns.length === 0,
     JSON.stringify({ steps: queued.B.steps.length, turns: queued.B.turns.length }))
+}
+
+console.log('\n== 10c. 目标必须显式：省略 to 不再自动猜「最近活跃」==')
+{
+  const fleet = newFleet({ defaultAskMs: 50 })
+  // 省略 to：应被拒绝，并提示当前可用会话 + 建议显式写 to="other"
+  const noTo = await fleet.tools.get('peer_send').execute({ text: '忘了写目标' }, { agent: fleet.A })
+  check('省略 to 被拒绝（不静默投给最近活跃）',
+    noTo.ok === false && noTo.text.includes('缺少 to 参数'), JSON.stringify(noTo).slice(0, 200))
+  check('拒绝时未投递任何消息', fleet.B.delivered.length === 0, 'inbox=' + fleet.B.delivered.length)
+  check('拒绝时列出可用目标并提示显式写 to="other"',
+    noTo.text.includes('会话B') && noTo.text.includes('to="other"'), noTo.text.slice(0, 260))
+  check('省略 to 的 peer_ask 同样被拒绝',
+    (await fleet.tools.get('peer_ask').execute({ text: '忘了写目标' }, { agent: fleet.A })).ok === false)
+
+  // 显式 to="other" 仍然照旧（允许清单为空 = 不受限）
+  const explicitOther = await fleet.tools.get('peer_send').execute({ to: 'other', text: '显式要最近活跃' }, { agent: fleet.A })
+  check('显式 to="other" 仍可用', explicitOther.ok === true, JSON.stringify(explicitOther).slice(0, 160))
+  check('显式 to="other" 时确实投出去了', fleet.B.delivered.length === 1, 'inbox=' + fleet.B.delivered.length)
+
+  // 找不到目标时：不自动改投别人，并给出「完整 id」建议
+  const missing = await fleet.tools.get('peer_send').execute({ to: '不存在的会话名', text: 'x' }, { agent: fleet.A })
+  check('目标解析失败时不改投别人', missing.ok === false && fleet.B.delivered.length === 1, 'inbox=' + fleet.B.delivered.length)
+  check('报错里给出候选的完整 id 供精确重发',
+    missing.text.includes('不会自动改投别人') && missing.text.includes('session-bbbb'),
+    missing.text.slice(0, 260))
+
+  // 部署方显式配 defaultPeer=具体别名时，仍允许省略
+  const pinned = newFleet({ defaultAskMs: 50, defaultPeer: 'session-bbbb' })
+  const pinnedSend = await pinned.tools.get('peer_send').execute({ text: '靠 defaultPeer 兜底' }, { agent: pinned.A })
+  check('defaultPeer 配成具体目标时，省略 to 仍按它投递',
+    pinnedSend.ok === true && pinned.B.delivered.length === 1, JSON.stringify(pinnedSend).slice(0, 160))
+}
+
+console.log('\n== 10d. 撤回与叫停：peer_recall / peer_stop ==')
+{
+  // ① 还没被处理 → 撤回成功，消息从对端队列消失
+  const fleet = newFleet({ defaultAskMs: 50 })
+  const sent = await fleet.tools.get('peer_send').execute({ to: 'session-bbbb', text: '这条要被撤回' }, { agent: fleet.A })
+  check('先投出去一条', fleet.B.inbox.nextTurn.length === 1, 'nextTurn=' + fleet.B.inbox.nextTurn.length)
+  const recalled = await fleet.tools.get('peer_recall').execute({ corr: sent.corr }, { agent: fleet.A })
+  check('未消费的消息可以撤回', recalled.ok === true && recalled.status === 'recalled', JSON.stringify(recalled).slice(0, 160))
+  check('撤回后对端队列里没有它了', fleet.B.inbox.nextTurn.length === 0, 'nextTurn=' + fleet.B.inbox.nextTurn.length)
+  check('撤回回执说明「还没开始处理」', recalled.text.includes('还没开始处理'), recalled.text.slice(0, 160))
+
+  // ② 已被对端消费（user/message 事件命中 msgId）→ 撤回失败，并指向 peer_stop
+  const fleet2 = newFleet({ defaultAskMs: 50 })
+  const sent2 = await fleet2.tools.get('peer_send').execute({ to: 'session-bbbb', text: '这条已被处理' }, { agent: fleet2.A })
+  const msgId = fleet2.B.inbox.nextTurn[0].id
+  fleet2.emit('user/message', 'session-bbbb', { id: msgId, role: 'user', content: [{ type: 'text', text: '信封' }], source: { kind: 'user' } })
+  const late = await fleet2.tools.get('peer_recall').execute({ corr: sent2.corr }, { agent: fleet2.A })
+  check('已开始处理的消息撤不回', late.ok === false && late.status === 'consumed', JSON.stringify(late).slice(0, 160))
+  check('撤不回时指向 peer_stop', late.text.includes('peer_stop'), late.text.slice(0, 220))
+
+  // ③ 未知 corr → 明确报错，不静默
+  const unknown = await fleet2.tools.get('peer_recall').execute({ corr: 'nope' }, { agent: fleet2.A })
+  check('未知 corr 明确报错', unknown.ok === false && unknown.text.includes('找不到 corr'), unknown.text.slice(0, 140))
+  check('空 corr 被拒绝', (await fleet2.tools.get('peer_recall').execute({}, { agent: fleet2.A })).ok === false)
+
+  // ④ peer_stop：叫停当前轮，默认连队列一起清
+  const fleet3 = newFleet({ defaultAskMs: 50 })
+  fleet3.B.status = 'running'
+  await fleet3.tools.get('peer_send').execute({ to: 'session-bbbb', text: '一条排队消息' }, { agent: fleet3.A })
+  const stopped = await fleet3.tools.get('peer_stop').execute({ to: 'session-bbbb' }, { agent: fleet3.A })
+  check('peer_stop 叫停成功', stopped.ok === true && stopped.status === 'stopped', JSON.stringify(stopped).slice(0, 160))
+  check('叫停走的是 Agent.cancel({kind:user})', fleet3.B.cancelled.length === 1 && fleet3.B.cancelled[0].cause.kind === 'user', JSON.stringify(fleet3.B.cancelled))
+  check('默认 keepInbox=false（队列被清）', fleet3.B.cancelled[0].keepInbox === false && fleet3.B.inbox.nextStep.length === 0, JSON.stringify(fleet3.B.cancelled))
+  check('回执如实说明中止了哪一轮与清了队列', stopped.text.includes('当前这一轮被中止') && stopped.text.includes('待处理消息已被清空'), stopped.text.slice(0, 240))
+
+  // ⑤ peer_stop keepInbox=true：只停当前轮，队列保留
+  const fleet4 = newFleet({ defaultAskMs: 50 })
+  fleet4.B.status = 'running'
+  await fleet4.tools.get('peer_send').execute({ to: 'session-bbbb', text: '保留这条' }, { agent: fleet4.A })
+  const kept = await fleet4.tools.get('peer_stop').execute({ to: 'session-bbbb', keepInbox: true }, { agent: fleet4.A })
+  check('keepInbox=true 时队列保留', kept.ok === true && fleet4.B.inbox.nextStep.length === 1 && fleet4.B.cancelled[0].keepInbox === true, JSON.stringify({ steps: fleet4.B.inbox.nextStep.length, cancelled: fleet4.B.cancelled }))
+  check('回执说明队列保留', kept.text.includes('队列里待处理的消息保留'), kept.text.slice(0, 200))
+
+  // ⑥ 对端没在跑：如实说明是空操作，不谎称停了
+  const fleet5 = newFleet({ defaultAskMs: 50 })
+  const idleStop = await fleet5.tools.get('peer_stop').execute({ to: 'session-bbbb' }, { agent: fleet5.A })
+  check('对端空闲时如实说「没在跑，空操作」', idleStop.ok === true && idleStop.text.includes('没在跑'), idleStop.text.slice(0, 200))
+
+  // ⑥b 用户在输入框里的入口：/session-bus recall <corr> 与 /session-bus stop <会话> [keep]
+  const fleet6 = newFleet({ defaultAskMs: 50 })
+  const sent6 = await fleet6.tools.get('peer_send').execute({ to: 'session-bbbb', text: '用命令撤回' }, { agent: fleet6.A })
+  const cmdRecall = await runCommand(fleet6, fleet6.A, 'recall ' + sent6.corr)
+  check('命令 recall <corr> 能撤回已投递消息',
+    cmdRecall.kind === 'success' && fleet6.B.inbox.nextTurn.length === 0, JSON.stringify(cmdRecall).slice(0, 160))
+  check('命令 recall 缺 corr 时给出用法', (await runCommand(fleet6, fleet6.A, 'recall')).kind === 'error')
+
+  const fleet7 = newFleet({ defaultAskMs: 50 })
+  fleet7.B.status = 'running'
+  await fleet7.tools.get('peer_send').execute({ to: 'session-bbbb', text: '排队一条' }, { agent: fleet7.A })
+  const cmdStop = await runCommand(fleet7, fleet7.A, 'stop session-bbbb')
+  check('命令 stop <会话> 能叫停并清队列',
+    cmdStop.kind === 'success' && fleet7.B.cancelled.length === 1 && fleet7.B.inbox.nextStep.length === 0,
+    JSON.stringify(cmdStop).slice(0, 180))
+  const fleet8 = newFleet({ defaultAskMs: 50 })
+  fleet8.B.status = 'running'
+  await fleet8.tools.get('peer_send').execute({ to: 'session-bbbb', text: '保留一条' }, { agent: fleet8.A })
+  const cmdStopKeep = await runCommand(fleet8, fleet8.A, 'stop session-bbbb keep')
+  check('命令 stop ... keep 保留队列',
+    cmdStopKeep.kind === 'success' && fleet8.B.inbox.nextStep.length === 1, JSON.stringify(cmdStopKeep).slice(0, 180))
+  check('命令 stop 缺目标时给出用法', (await runCommand(fleet6, fleet6.A, 'stop')).kind === 'error')
+  check('命令 help 里列出 recall / stop',
+    (await runCommand(fleet6, fleet6.A, 'list')).text.includes('recall') && (await runCommand(fleet6, fleet6.A, 'list')).text.includes('stop'))
+
+  // ⑦ peer_stop 省略 to / 目标不存在 → 明确拒绝
+  check('peer_stop 省略 to 被拒绝', (await fleet5.tools.get('peer_stop').execute({}, { agent: fleet5.A })).ok === false)
+  const noTarget = await fleet5.tools.get('peer_stop').execute({ to: 'session-zzzz' }, { agent: fleet5.A })
+  check('peer_stop 目标不存在时明确报错', noTarget.ok === false && noTarget.text.includes('找不到目标会话'), noTarget.text.slice(0, 140))
 }
 
 console.log('\n== 11. 面板只读路由：catalog / allow ==')
@@ -732,7 +864,7 @@ console.log('\n== 11. 面板只读路由：catalog / allow ==')
   check('清单路由已注册（exact）', allowRoute !== undefined && allowRoute.kind === 'exact')
   out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-aaaa', headers: HOST })
   check('未设清单时 unrestricted=true', out.status === 200 && JSON.parse(out.body).unrestricted === true, out.body)
-  runCommand(fleet, fleet.A, 'allow session-bbbb')
+  await runCommand(fleet, fleet.A, 'allow session-bbbb')
   out = await call(allowRoute, { method: 'GET', url: ALLOW_PATH + '?session=session-aaaa', headers: HOST })
   const allow = JSON.parse(out.body)
   check('设了清单后返回 ids 真值', out.status === 200 && allow.unrestricted === false && JSON.stringify(allow.ids) === JSON.stringify(['session-bbbb']), out.body)

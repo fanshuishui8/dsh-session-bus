@@ -2,7 +2,7 @@
 
 **DSH 会话间消息总线** — 让**同一个 dsh 进程内**的任意两个会话互发消息：提问/答复、通知/触发、多轮协作。
 
-`dsh-session-bus` is a zero-dependency Cordis host plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): any two Sessions in the same `dsh` process can message each other, ask questions and get answers, through 7 model-facing tools.
+`dsh-session-bus` is a zero-dependency Cordis host plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): any two Sessions in the same `dsh` process can message each other, ask questions and get answers, through 9 model-facing tools.
 
 ---
 
@@ -69,6 +69,19 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 `workspaceRegistry` / `sessions` / `sessionQuery` 刻意**不进 `inject`**：它们只被这两条只读路由用到，
 缺失时降级（空工作区、空标题），不能因为一个可选读服务缺失就让整条消息总线拒绝激活。
 
+## 撤回与叫停（投错了 / 跑偏了怎么办）
+
+| 想做的事 | 怎么做 |
+| --- | --- |
+| 撤回一条**还在等答复**的提问 | `peer_cancel(corr=…)` —— 立刻收口，迟到答复会被丢弃 |
+| 撤回一条**已投递、对端还没开始处理**的消息 | `peer_recall(corr=…)`（或输入框 `/session-bus recall <corr>`）—— 用 `Agent.inbox.remove()` 从对端待处理队列里摘掉 |
+| 消息**已被对端开始处理** | 撤不回来了（`peer_recall` 会如实说「已开始处理」并指向下一步）→ 用 `peer_stop` |
+| **叫停对端当前这一轮** | `peer_stop(to=…)`（或 `/session-bus stop <会话> [keep]`）—— 走官方 `agent.cancel({kind:'user'}, {keepInbox})`；默认连它队列里待处理的消息一起清空（**含非本总线的**），加 `keep` / `keepInbox: true` 只停当前轮 |
+
+两个入口都有：模型用 `peer_recall` / `peer_stop`，**人**可以直接在输入框敲 `/session-bus recall <corr>` 与
+`/session-bus stop <会话> [keep]`。回执一律如实说明「撤到了什么 / 没撤到什么、为什么」——
+撤不回时不假装成功，而是告诉你还剩哪条路。
+
 ## 按需唤醒（allowResume，默认开）
 
 目标会话**未附着**（没有任何打开的页面连上它）时，插件会先唤醒它再投递：
@@ -99,18 +112,19 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 
 ```bash
 npm test                 # 两个套件都跑
-node test/smoke.mjs      # 宿主半：181 项
+node test/smoke.mjs      # 宿主半：225 项
 node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 ```
 
 `test/smoke.mjs` 用一个假宿主（假 `ctx` / `agents` / `sessions` / `workspaceRegistry` / `sessionQuery` /
-`sessionTitle` / `tools` / `timer` / `webServer`）跑 181 项检查，覆盖：工具注册与 **schema 子集**
+`sessionTitle` / `tools` / `timer` / `webServer`）跑 225 项检查，覆盖：工具注册与 **schema 子集**
 （安装后最容易踩的加载期失败点）、投递、显式答复、兜底捕获、忙闲自适应、目标不存在、限速、撤回
 （含撤回仍在等待中的提问）、超时后迟到答复注入、`peer_inbox` 时间线、投影单元契约（zod 的 `.parse` 冷读路径）、
 以及三条只读路由的可信 200 / 不可信 403 / 非 `GET`/`HEAD` 405 / 缺参 400 / 未知会话 404、
 目录字段白名单、未附着标题批量读取与 TTL 缓存、「最后活动时间」的官方口径（`lastPromptAt` 优先、缺失退化为 `createdAt`）、
 以及**投递原语的选择**（空闲走 `followup` / 在跑走 `steer`、连发两条不再串行、状态滞后时按未收口 turn 判忙、显式 `mode` 优先）、
-**等待契约**（`peer_ask` 描述与超时回执都声明「超时≠失败、不要自己去重复对方的工作」，迟到答复点明「结论已到、别再跑一遍」）。
+**等待契约**（`peer_ask` 描述与超时回执都声明「超时≠失败、不要自己去重复对方的工作」，迟到答复点明「结论已到、别再跑一遍」）、
+**目标必须显式**（省略 `to` 被拒绝、解析失败不改投别人）、**撤回与叫停**（未消费可撤回 / 已消费如实拒绝并指向 `peer_stop` / `cancel` 的 keepInbox 语义 / 两条用户命令）。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
 假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册
@@ -136,7 +150,7 @@ node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 真机验收清单：
 
 - [ ] 重启后日志出现 `[dsh-session-bus] 已启动`
-- [ ] 任一会话里问模型「你有 peer_ask 工具吗」→ 能看到 7 个工具
+- [ ] 任一会话里问模型「你有 peer_ask 工具吗」→ 能看到 9 个工具
 - [ ] 两个标签页：A 里说「问一下另一个会话：你的工作目录是什么」→ A 的 `peer_ask` 结果里出现 B 的答复
 - [ ] B 侧出现一条【会话间消息】并作答（可选：B 用 `peer_reply` 显式回）
 - [ ] 让 B 跑一个长任务，再从 A `peer_ask` → A 只等 10 秒返回「已排队」，任务结束后答复自动进入 A
@@ -174,6 +188,21 @@ node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 11. **dotted 服务名只能用反射 `get` 取，不能点属性**：Cordis 里 `remote.commands` 是注册名就叫 `remote.commands` 的服务（`super(ctx, remoteServiceKey(name))`），而 `ctx.get('remote')` 返回的是 **traceable 代理** —— 在它上面点 `.commands` 会被代理当成**属性访问**，走 `internal/get` 的纤维回溯，要求访问方 fiber 在 `inject` 里声明过该服务，否则抛 `cannot get property "remote.commands" without inject`。三种写法里只有 `ctx.get('remote.commands')`（反射 get，直接查 store）无条件可用。这个坑在假宿主里看不出来（假 ctx 往往就是普通对象），本包 v0.3.5 就是这样带着全绿测试上了真机、被用户点「应用」时炸出来的：**凡是跨服务的取用，假宿主都要照抄真规则**。
 
 ## 更新记录
+
+- **v0.3.12** — 新增**撤回已投递消息**与**叫停对方**两条出路（原来只有 `peer_cancel` 能撤「还在等答复」的提问，
+  投出去的消息一旦进了对端队列就再也收不回）：
+  - `peer_recall(corr)`：用 `Agent.inbox.remove(msgId)` 从对端**待处理队列**里摘掉那条消息；
+    若对端已经开始处理（`user/message` 事件命中该 msgId）则**撤不回**，如实说明并指向 `peer_stop`。
+  - `peer_stop(to, keepInbox?)`：走官方 `agent.cancel({kind:'user'}, {keepInbox})` 叫停对端当前这一轮；
+    默认连它队列里待处理的消息一起清空（含非本总线的，回执会说明），`keepInbox: true` 只停当前轮。
+  - 用户侧同样可用：输入框 `/session-bus recall <corr>`、`/session-bus stop <会话> [keep]`。
+  - 工具数 7 → 9。测试：宿主 181 → 225 项（新增 17 条覆盖撤回/叫停的成功与失败路径，8 条覆盖两条命令）。
+- **v0.3.11** — 目标必须显式：`to` 进入 required，**省略不再自动猜「最近活跃」**（几十个会话的进程里几乎必然投错），
+  解析失败也**不改投别人**，报错里给出候选的完整 id 供精确重发；`defaultPeer` 配成具体目标时才允许省略。测试 181 → 190 项。
+- **v0.3.10** — 把等待契约写进模型可见处：`peer_ask` 描述与超时回执都声明「超时≠失败、不要自己去重复对方的工作」，
+  迟到答复信封点明「结论已到、别再跑一遍」（此前模型会把超时当失败，自己动手核对同一件事，白费一轮）。测试 176 → 181 项。
+- **v0.3.9** — 修「连发两条消息会排队」：投递默认改 `auto`（在跑走 `steer` 合入当前轮、空闲走 `followup` 独占一轮），
+  忙闲判定加上「未收口 turn」与「inbox 已压 next-turn」。测试 166 → 176 项。
 
 - **v0.3.10** — 修「等答复期间自己去做重复的事、白费一轮」：把等待契约写进**模型可见**的地方 ——
   `peer_ask` 的工具描述明确 `status=timeout` 不是失败、不需要重问，并**禁止在等待期间重复对方该做的事**

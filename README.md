@@ -83,7 +83,13 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 
 ## 工作语义
 
-1. **投递** = `ctx.agents.get(targetId).followup(手写 UserMessage)`：对端空闲则立刻起一轮；对端 `running` 则进它的 inbox 排队，等它自己那一轮结束。
+1. **投递** = `ctx.agents.get(targetId).steer|followup(手写 UserMessage)`，**默认 `auto`**：
+   对端**空闲** → `followup`（独占一轮，立刻起）；对端**在跑** → `steer`（提交给最近的 step 边界，
+   合入它当前这一轮）。两个原语的契约差别很关键 —— `followup` 是「一条消息独占一整轮」，
+   所以对忙着的对端连发两条会串行成两轮、第二条要等第一轮整轮跑完；`steer` 则合入当前轮，
+   连发多条不会互相排队。可用 `mode: 'steer' | 'queue'` 显式指定（`queue` 即 `followup`）。
+   「在跑」的判定不只看 `agent.status`：本插件还看自己观测到的**未收口 turn** 与对端 inbox 里
+   已压着的 `next-turn` 工作 —— 状态翻转有延迟，只看状态会把忙着的对端误判成空闲。
 2. **答复双保险**：①对端显式 `peer_reply` → 立刻回到调用方的工具结果；②否则监听全局 `session/event`，在**对端处理该消息的那一轮** `turn/end` 时自动捕获该轮最后一段 assistant 文本回传。
 3. **时间轴自描述**：所有时间都是本机本地时间（带偏移）；每条异步答复都带原问题、两个时间点与耗时。
 4. **忙闲自适应**：投递前查对端 `status`，`running` 时只等 `busyWaitMs` 就转异步，不堵住调用方自己的轮次。
@@ -93,16 +99,17 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 
 ```bash
 npm test                 # 两个套件都跑
-node test/smoke.mjs      # 宿主半：166 项
+node test/smoke.mjs      # 宿主半：176 项
 node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 ```
 
 `test/smoke.mjs` 用一个假宿主（假 `ctx` / `agents` / `sessions` / `workspaceRegistry` / `sessionQuery` /
-`sessionTitle` / `tools` / `timer` / `webServer`）跑 166 项检查，覆盖：工具注册与 **schema 子集**
+`sessionTitle` / `tools` / `timer` / `webServer`）跑 176 项检查，覆盖：工具注册与 **schema 子集**
 （安装后最容易踩的加载期失败点）、投递、显式答复、兜底捕获、忙闲自适应、目标不存在、限速、撤回
 （含撤回仍在等待中的提问）、超时后迟到答复注入、`peer_inbox` 时间线、投影单元契约（zod 的 `.parse` 冷读路径）、
 以及三条只读路由的可信 200 / 不可信 403 / 非 `GET`/`HEAD` 405 / 缺参 400 / 未知会话 404、
-目录字段白名单、未附着标题批量读取与 TTL 缓存、「最后活动时间」的官方口径（`lastPromptAt` 优先、缺失退化为 `createdAt`）。
+目录字段白名单、未附着标题批量读取与 TTL 缓存、「最后活动时间」的官方口径（`lastPromptAt` 优先、缺失退化为 `createdAt`）、
+以及**投递原语的选择**（空闲走 `followup` / 在跑走 `steer`、连发两条不再串行、状态滞后时按未收口 turn 判忙、显式 `mode` 优先）。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
 假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册
@@ -166,6 +173,13 @@ node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 11. **dotted 服务名只能用反射 `get` 取，不能点属性**：Cordis 里 `remote.commands` 是注册名就叫 `remote.commands` 的服务（`super(ctx, remoteServiceKey(name))`），而 `ctx.get('remote')` 返回的是 **traceable 代理** —— 在它上面点 `.commands` 会被代理当成**属性访问**，走 `internal/get` 的纤维回溯，要求访问方 fiber 在 `inject` 里声明过该服务，否则抛 `cannot get property "remote.commands" without inject`。三种写法里只有 `ctx.get('remote.commands')`（反射 get，直接查 store）无条件可用。这个坑在假宿主里看不出来（假 ctx 往往就是普通对象），本包 v0.3.5 就是这样带着全绿测试上了真机、被用户点「应用」时炸出来的：**凡是跨服务的取用，假宿主都要照抄真规则**。
 
 ## 更新记录
+
+- **v0.3.9** — 修「连发两条消息会排队、任务迟迟收不了尾」：投递默认改为 **`auto`** ——
+  对端**空闲**用 `followup`（独占一轮），对端**在跑**用 `steer`（合入当前轮，不再等整轮跑完）。
+  根因是 `followup` 的契约「一条消息独占一整轮」：连发两条必然串行成两轮，第二条要等第一轮整轮结束。
+  「在跑」的判定不再只看 `agent.status`（状态翻转有延迟），还看本插件观测到的**未收口 turn**
+  与对端 inbox 里已压着的 `next-turn` 工作；`peer_send` / `peer_ask` 的回执会如实写明这次走了哪个原语。
+  仍可显式 `mode: 'queue' | 'steer'`。测试：宿主 166 → 176 项。
 
 - **v0.3.8** — 面板补上「最后活动时间」：`GET /session-bus/catalog` 的会话行新增 `updatedAt`，
   口径与官方会话列表**完全一致**（`max(header.createdAt, sessionListMetadata.lastPromptAt)`，

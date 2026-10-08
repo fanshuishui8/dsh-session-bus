@@ -211,9 +211,12 @@ function newFleet(config = {}) {
     const agent = {
       id, status,
       session: { id, header: { createdAt: Date.now(), cwd: '/tmp' }, __title: title },
-      inbox: [], injected: [],
-      followup(msg) { agent.inbox.push(msg) },
-      steer(msg) { agent.inbox.push(msg) },
+      // 兼容旧断言：所有投递都进 inbox；同时分别记录走了哪个原语。
+      // 真 Agent.inbox 是 Inbox 对象（有 nextTurn/nextStep 数组）——isBusy 会读 nextTurn，
+      // 测试里给数组挂一个 nextTurn 属性即可模拟「还压着待处理的一轮」。
+      inbox: [], injected: [], turns: [], steps: [],
+      followup(msg) { agent.inbox.push(msg); agent.turns.push(msg) },
+      steer(msg) { agent.inbox.push(msg); agent.steps.push(msg) },
       inject(msg) { agent.injected.push(msg) },
     }
     agents.set(id, agent)
@@ -578,6 +581,67 @@ console.log('\n== 10. 按需唤醒（allowResume）==')
   const other = 'session-feedface-0000-0000-0000-000000000003'
   const blocked = await fleet2.tools.get('peer_send').execute({ to: other, text: '越界' }, { agent: fleet2.A })
   check('允许清单外的未附着 id 被拦', blocked.ok === false && String(blocked.text).includes('不在本会话的允许清单里'), JSON.stringify(blocked).slice(0, 160))
+}
+
+console.log('\n== 10b. 投递原语：默认 auto（忙则合入当前轮，空闲才独占一轮）==')
+{
+  // 空闲对端：走 followup（独占一轮），不进 steps
+  const idle = newFleet({ defaultAskMs: 50 })
+  const sent = await idle.tools.get('peer_send').execute({ to: 'session-bbbb', text: '空闲时投递' }, { agent: idle.A })
+  check('对端空闲 → queue/followup（独占一轮）',
+    idle.B.turns.length === 1 && idle.B.steps.length === 0, JSON.stringify({ turns: idle.B.turns.length, steps: idle.B.steps.length }))
+  check('回执如实说明用了 queue', sent.text.includes('queue=独占一轮'), sent.text.slice(0, 160))
+
+  // 忙对端（status=running）：走 steer（合入当前轮），不排整轮
+  const busy = newFleet({ defaultAskMs: 50 })
+  busy.B.status = 'running'
+  const sent2 = await busy.tools.get('peer_send').execute({ to: 'session-bbbb', text: '忙时投递' }, { agent: busy.A })
+  check('对端在跑 → steer（合入当前轮）',
+    busy.B.steps.length === 1 && busy.B.turns.length === 0, JSON.stringify({ turns: busy.B.turns.length, steps: busy.B.steps.length }))
+  check('回执如实说明用了 steer', sent2.text.includes('steer=合入对端当前这一轮'), sent2.text.slice(0, 160))
+
+  // 连发两条给「在跑」的对端：两条都应走 steer，不会一条 followup 排到下一轮
+  const twice = newFleet({ defaultAskMs: 50 })
+  twice.B.status = 'running'
+  await twice.tools.get('peer_send').execute({ to: 'session-bbbb', text: '第一条' }, { agent: twice.A })
+  await twice.tools.get('peer_send').execute({ to: 'session-bbbb', text: '第二条' }, { agent: twice.A })
+  check('连发两条都在 steps 里（不再串行成两轮）',
+    twice.B.steps.length === 2 && twice.B.turns.length === 0,
+    JSON.stringify({ steps: twice.B.steps.length, turns: twice.B.turns.length }))
+
+  // 状态还没翻转（status 仍是 idle），但本插件已观测到未收口的 turn → 也应判为忙
+  const turnOpen = newFleet({ defaultAskMs: 50 })
+  turnOpen.emit('turn/start', 'session-bbbb', { turn: 1 })
+  await turnOpen.tools.get('peer_send').execute({ to: 'session-bbbb', text: 'turn 还开着' }, { agent: turnOpen.A })
+  check('status 滞后但 turn 未收口 → 也按忙处理（走 steer）',
+    turnOpen.B.steps.length === 1 && turnOpen.B.turns.length === 0,
+    JSON.stringify({ steps: turnOpen.B.steps.length, turns: turnOpen.B.turns.length }))
+  turnOpen.emit('turn/end', 'session-bbbb', { turn: 1, reason: { kind: 'completed' } })
+  await turnOpen.tools.get('peer_send').execute({ to: 'session-bbbb', text: 'turn 收口后' }, { agent: turnOpen.A })
+  check('turn 收口后回到 queue（独占一轮）',
+    turnOpen.B.turns.length === 1 && turnOpen.B.steps.length === 1,
+    JSON.stringify({ steps: turnOpen.B.steps.length, turns: turnOpen.B.turns.length }))
+
+  // 显式指定仍然照办
+  const forced = newFleet({ defaultAskMs: 50 })
+  forced.B.status = 'running'
+  await forced.tools.get('peer_send').execute({ to: 'session-bbbb', text: '强制排队', mode: 'queue' }, { agent: forced.A })
+  check('显式 mode=queue 时对端再忙也独占一轮',
+    forced.B.turns.length === 1 && forced.B.steps.length === 0,
+    JSON.stringify({ turns: forced.B.turns.length, steps: forced.B.steps.length }))
+  const forced2 = newFleet({ defaultAskMs: 50 })
+  await forced2.tools.get('peer_send').execute({ to: 'session-bbbb', text: '强制 steer', mode: 'steer' }, { agent: forced2.A })
+  check('显式 mode=steer 时对端空闲也合入当前轮',
+    forced2.B.steps.length === 1 && forced2.B.turns.length === 0,
+    JSON.stringify({ steps: forced2.B.steps.length, turns: forced2.B.turns.length }))
+
+  // inbox 里压着 next-turn 的工作（例如另一条总线消息）→ 也判为忙
+  const queued = newFleet({ defaultAskMs: 50 })
+  queued.B.inbox.nextTurn = [{}]
+  await queued.tools.get('peer_send').execute({ to: 'session-bbbb', text: '已有排队工作' }, { agent: queued.A })
+  check('inbox 里已压着 next-turn 工作 → 走 steer 而不是再排一轮',
+    queued.B.steps.length === 1 && queued.B.turns.length === 0,
+    JSON.stringify({ steps: queued.B.steps.length, turns: queued.B.turns.length }))
 }
 
 console.log('\n== 11. 面板只读路由：catalog / allow ==')

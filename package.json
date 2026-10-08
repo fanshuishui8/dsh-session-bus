@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-bus",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "DSH 会话间消息总线：同一个 dsh 进程内任意两个会话互发消息、提问/答复、异步协作，并在输入框左侧提供多选面板挑选可通信的会话",
   "type": "module",
   "main": "lib/index.js",

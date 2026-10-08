@@ -112,19 +112,19 @@ B: （被唤醒，处理，作答）→ 答复回到 A 的工具结果里
 
 ```bash
 npm test                 # 两个套件都跑
-node test/smoke.mjs      # 宿主半：225 项
+node test/smoke.mjs      # 宿主半：229 项
 node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 ```
 
 `test/smoke.mjs` 用一个假宿主（假 `ctx` / `agents` / `sessions` / `workspaceRegistry` / `sessionQuery` /
-`sessionTitle` / `tools` / `timer` / `webServer`）跑 225 项检查，覆盖：工具注册与 **schema 子集**
+`sessionTitle` / `tools` / `timer` / `webServer`）跑 229 项检查，覆盖：工具注册与 **schema 子集**
 （安装后最容易踩的加载期失败点）、投递、显式答复、兜底捕获、忙闲自适应、目标不存在、限速、撤回
 （含撤回仍在等待中的提问）、超时后迟到答复注入、`peer_inbox` 时间线、投影单元契约（zod 的 `.parse` 冷读路径）、
 以及三条只读路由的可信 200 / 不可信 403 / 非 `GET`/`HEAD` 405 / 缺参 400 / 未知会话 404、
 目录字段白名单、未附着标题批量读取与 TTL 缓存、「最后活动时间」的官方口径（`lastPromptAt` 优先、缺失退化为 `createdAt`）、
 以及**投递原语的选择**（空闲走 `followup` / 在跑走 `steer`、连发两条不再串行、状态滞后时按未收口 turn 判忙、显式 `mode` 优先）、
 **等待契约**（`peer_ask` 描述与超时回执都声明「超时≠失败、不要自己去重复对方的工作」，迟到答复点明「结论已到、别再跑一遍」）、
-**目标必须显式**（省略 `to` 被拒绝、解析失败不改投别人）、**撤回与叫停**（未消费可撤回 / 已消费如实拒绝并指向 `peer_stop` / `cancel` 的 keepInbox 语义 / 两条用户命令）。
+**目标必须显式**（省略 `to` 被拒绝、解析失败不改投别人）、**迟到答复不再排成多轮**（提问方在跑就合入当前轮）、**撤回与叫停**（未消费可撤回 / 已消费如实拒绝并指向 `peer_stop` / `cancel` 的 keepInbox 语义 / 两条用户命令）。
 
 `test/client.mjs` 在假 `window.__ModuleLoader__` / 假 React（**带 useState/useEffect 与重渲染**）/
 假 Cordis ctx / 假 `fetch` 下加载 `lib/client.js`，跑 49 项检查：模块与插件形状、内置落点的注册
@@ -188,6 +188,12 @@ node test/client.mjs     # 浏览器半：49 项（不需要浏览器）
 11. **dotted 服务名只能用反射 `get` 取，不能点属性**：Cordis 里 `remote.commands` 是注册名就叫 `remote.commands` 的服务（`super(ctx, remoteServiceKey(name))`），而 `ctx.get('remote')` 返回的是 **traceable 代理** —— 在它上面点 `.commands` 会被代理当成**属性访问**，走 `internal/get` 的纤维回溯，要求访问方 fiber 在 `inject` 里声明过该服务，否则抛 `cannot get property "remote.commands" without inject`。三种写法里只有 `ctx.get('remote.commands')`（反射 get，直接查 store）无条件可用。这个坑在假宿主里看不出来（假 ctx 往往就是普通对象），本包 v0.3.5 就是这样带着全绿测试上了真机、被用户点「应用」时炸出来的：**凡是跨服务的取用，假宿主都要照抄真规则**。
 
 ## 更新记录
+
+- **v0.3.13** — 修「N 条排队消息迟迟不消化」：`lateReply()` 投递迟到答复时**写死了 `'queue'`**，
+  而 `queue` = `followup` = 每条独占一整轮 —— 提问方正在跑长任务时，几条答复就排成好几轮。
+  v0.3.9 只改了 `sendTo` 的默认值，**漏了这个调用点**。现改为 `auto`：提问方在跑 → `steer` 合入它当前轮
+  （立刻可见），空闲 → `followup` 起一轮。新增 3 条回归断言（单条走 nextStep / 连来三条仍全部合入当前轮 /
+  空闲时进 nextTurn）。测试：宿主 225 → 229 项。
 
 - **v0.3.12** — 新增**撤回已投递消息**与**叫停对方**两条出路（原来只有 `peer_cancel` 能撤「还在等答复」的提问，
   投出去的消息一旦进了对端队列就再也收不回）：

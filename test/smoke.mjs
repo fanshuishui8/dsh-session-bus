@@ -426,6 +426,9 @@ console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
   check('迟到答复信封带原问题', injected.includes('你当时问的是') && injected.includes('迟到答复测试'), injected.slice(0, 300))
   check('迟到答复信封带耗时', /端到端耗时/.test(injected), injected.slice(0, 200))
   check('迟到答复点明「结论已到、不要再自己跑一遍」', injected.includes('不要再自己去跑一遍'), injected.slice(-260))
+  check('迟到答复走 auto（提问方空闲时进 nextTurn，而不是写死进某一队列）',
+    host.A.inbox.nextTurn.length === 1 && host.A.inbox.nextStep.length === 0,
+    JSON.stringify({ nextTurn: host.A.inbox.nextTurn.length, nextStep: host.A.inbox.nextStep.length }))
 }
 
 console.log('\n== 7. peer_inbox / peer_self 可读性 ==')
@@ -670,6 +673,36 @@ console.log('\n== 10b. 投递原语：默认 auto（忙则合入当前轮，空�
   check('inbox 里已压着 next-turn 工作 → 走 steer 而不是再排一轮',
     queued.B.steps.length === 1 && queued.B.turns.length === 0,
     JSON.stringify({ steps: queued.B.steps.length, turns: queued.B.turns.length }))
+}
+
+console.log('\n== 10b2. 迟到答复不再排成多轮（提问方在跑 → 合入当前轮）==')
+{
+  const host = newFleet({ defaultAskMs: 40 })
+  // 提问方正在跑长任务（status=running）：这时对端答复迟到，答复必须 steer 合入它当前轮
+  host.A.status = 'running'
+  const ask = host.tools.get('peer_ask').execute({ to: 'session-bbbb', text: '我在跑长任务时问的' }, { agent: host.A })
+  const timedOut = await ask
+  check('先超时转异步', timedOut.status === 'timeout', JSON.stringify(timedOut).slice(0, 100))
+  const msgId = host.B.delivered[host.B.delivered.length - 1].id
+  finishTurn(host, 'session-bbbb', msgId, 5, '迟到结论A')
+  await new Promise((r) => setTimeout(r, 20))
+  check('提问方在跑时，迟到答复走 steer 进 nextStep（不排整轮）',
+    host.A.inbox.nextStep.length === 1 && host.A.inbox.nextTurn.length === 0,
+    JSON.stringify({ nextStep: host.A.inbox.nextStep.length, nextTurn: host.A.inbox.nextTurn.length }))
+
+  // 连来三条迟到答复：全部合入当前轮，不再「N 条排队消息」各占一轮
+  const ask2 = host.tools.get('peer_ask').execute({ to: 'session-bbbb', text: '第二条' }, { agent: host.A })
+  await ask2
+  const ask3 = host.tools.get('peer_ask').execute({ to: 'session-bbbb', text: '第三条' }, { agent: host.A })
+  await ask3
+  const ids = host.B.delivered.slice(-2).map((m) => m.id)
+  finishTurn(host, 'session-bbbb', ids[0], 6, '迟到结论B')
+  await new Promise((r) => setTimeout(r, 10))
+  finishTurn(host, 'session-bbbb', ids[1], 7, '迟到结论C')
+  await new Promise((r) => setTimeout(r, 20))
+  check('三条迟到答复全部合入当前轮（nextStep=3，nextTurn=0）',
+    host.A.inbox.nextStep.length === 3 && host.A.inbox.nextTurn.length === 0,
+    JSON.stringify({ nextStep: host.A.inbox.nextStep.length, nextTurn: host.A.inbox.nextTurn.length }))
 }
 
 console.log('\n== 10c. 目标必须显式：省略 to 不再自动猜「最近活跃」==')

@@ -295,6 +295,10 @@ console.log('\n== 2. 工具定义形状与 schema 子集 ==')
   for (const [tn, def] of tools) {
     const violations = []
     check(tn + ' 有 description', typeof def.description === 'string' && def.description.length > 10)
+    if (tn === 'peer_ask') {
+      check('peer_ask 描述声明超时≠失败', def.description.includes('不是失败'), def.description.slice(0, 120))
+      check('peer_ask 描述禁止等待期间重复对方的工作', def.description.includes('不要自己去重复对方该做的事'), def.description.slice(-160))
+    }
     check(tn + ' parameters 是 object schema', def.parameters && def.parameters.type === 'object', JSON.stringify(def.parameters))
     check(tn + ' output.render 是函数', typeof def.output.render === 'function')
     checkSchemaSubset(def.output.schema, tn + '.output', violations)
@@ -351,6 +355,8 @@ console.log('\n== 5. 忙闲自适应（对端 running 时短等待转异步） =
   check('说明对端在 running', got.text.includes('running'), got.text)
   check('给出 corr 供后续处理', typeof got.corr === 'string' && got.corr.length > 0)
   check('提示可用 peer_cancel 撤回', got.text.includes('peer_cancel'), got.text)
+  check('超时回执说明「不是失败、不需要重问」', got.text.includes('不是失败') && got.text.includes('不需要重问'), got.text.slice(0, 220))
+  check('超时回执明确禁止自己去重复对方的工作', got.text.includes('不要自己去重复对方该做的事'), got.text.slice(0, 260))
 }
 
 console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
@@ -398,6 +404,7 @@ console.log('\n== 6. 目标不存在 / 限速 / 撤回 ==')
   check('迟到答复注入提问方会话', injected.includes('迟到的结论'), injected.slice(0, 160))
   check('迟到答复信封带原问题', injected.includes('你当时问的是') && injected.includes('迟到答复测试'), injected.slice(0, 300))
   check('迟到答复信封带耗时', /端到端耗时/.test(injected), injected.slice(0, 200))
+  check('迟到答复点明「结论已到、不要再自己跑一遍」', injected.includes('不要再自己去跑一遍'), injected.slice(-260))
 }
 
 console.log('\n== 7. peer_inbox / peer_self 可读性 ==')
